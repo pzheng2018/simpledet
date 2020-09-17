@@ -3,39 +3,96 @@ from __future__ import print_function
 import mxnet as mx
 import mxnext as X
 
-from symbol.builder import Backbone, BboxHead
-from models.FPN import assign_layer_fpn, get_topk_proposal
+from symbol.builder import Backbone, RpnHead, BboxHead, Neck, RoiAlign
+from symbol.builder import Bbox2fcHead as FPNBbox2fcHead
+from models.FPN import assign_layer_fpn, get_top_proposal
 
 
-class FPNBbox2fcHead(BboxHead):
+class FPNBboxDualHeadSmall(BboxHead):
     def __init__(self, pBbox):
-        super(FPNBbox2fcHead, self).__init__(pBbox)
+        super().__init__(pBbox)
+
+    def add_norm(self, sym):
+        p = self.p
+        if p.normalizer.__name__ == "fix_bn":
+            pass
+        elif p.normalizer.__name__ in ["sync_bn", "gn"]:
+            sym = p.normalizer(sym)
+        else:
+            raise NotImplementedError("Unsupported normalizer: {}".format(p.normalizer.__name__))
+        return sym
+
+    def _reg_head(self, conv_feat):
+        num_block = self.p.num_block or 4
+
+        for i in range(num_block):
+            conv_feat = X.conv(
+                conv_feat,
+                kernel=3,
+                filter=256,
+                init=X.gauss(0.01),
+                name="bbox_reg_block%s" % (i + 1)
+            )
+            conv_feat = self.add_norm(conv_feat)
+            conv_feat = X.relu(conv_feat)
+
+        return conv_feat
+
+    def _cls_head(self, conv_feat):
+        xavier_init = mx.init.Xavier(factor_type="in", rnd_type="uniform", magnitude=3)
+
+        flatten = X.flatten(conv_feat, name="bbox_feat_flatten")
+        fc1 = X.fc(flatten, filter=1024, name="bbox_cls_fc1", init=xavier_init)
+        fc1 = self.add_norm(fc1)
+        fc1 = X.relu(fc1)
+        fc2 = X.fc(fc1, filter=1024, name="bbox_cls_fc2", init=xavier_init)
+        fc2 = self.add_norm(fc2)
+        fc2 = X.relu(fc2)
+
+        return fc2
 
     def _get_bbox_head_logit(self, conv_feat):
         if self._head_feat is not None:
             return self._head_feat
 
-        xavier_init = mx.init.Xavier(factor_type="in", rnd_type="uniform", magnitude=3)
-
-        flatten = X.flatten(conv_feat, name="bbox_feat_flatten")
-        fc1 = X.fc(flatten, filter=1024, name="bbox_fc1", init=xavier_init)
-        fc1 = X.relu(fc1)
-        fc2 = X.fc(fc1, filter=1024, name="bbox_fc2", init=xavier_init)
-        fc2 = X.relu(fc2)
-
-        self._head_feat = fc2
+        self._head_feat = dict(
+            classification=self._cls_head(conv_feat),
+            regression=self._reg_head(conv_feat)
+        )
 
         return self._head_feat
 
 
-class FPNRpnHead(object):
+class FPNRpnHead(RpnHead):
     def __init__(self, pRpn):
-        self.p = pRpn  # type: RPNParam
+        super().__init__(pRpn)
 
-        self.cls_logit_dict         = None
-        self.bbox_delta_dict        = None
-        self._proposal              = None
-        self._proposal_scores       = None
+        self.anchor_dict      = None
+        self.cls_logit_dict   = None
+        self.bbox_delta_dict  = None
+        self._proposal        = None
+        self._proposal_scores = None
+
+    def get_anchor(self):
+        p = self.p
+
+        if not p.nnvm_rpn_target and not p.nnvm_proposal:
+            return
+
+        anchor_scale = p.anchor_generate.scale
+        anchor_ratio = p.anchor_generate.ratio
+        num_anchor = len(p.anchor_generate.ratio) * len(p.anchor_generate.scale)
+        strides = p.anchor_generate.stride
+
+        anchor_dict = {}
+        for stride in strides:
+            max_side = p.anchor_generate.max_side // stride
+            anchors = X.var("anchor_stride%s" % stride,
+                shape=(1, 1, max_side, max_side, num_anchor * 4),
+                dtype='float32') # (1, 1, long_side, long_side, #anchor * 4)
+            anchor_dict["stride%s" % stride] = anchors
+
+        self.anchor_dict = anchor_dict
 
     def get_output(self, conv_fpn_feat):
         if self.cls_logit_dict is not None and self.bbox_delta_dict is not None:
@@ -46,12 +103,11 @@ class FPNRpnHead(object):
         conv_channel = p.head.conv_channel
 
         # FPN RPN share weight
-        normal001 = mx.init.Normal(sigma=0.01)
-        rpn_conv_weight = X.var('rpn_conv_weight', init=normal001)
+        rpn_conv_weight = X.var('rpn_conv_weight', init=X.gauss(0.01))
         rpn_conv_bias = X.var('rpn_conv_bias', init=X.zero_init())
-        rpn_conv_cls_weight = X.var('rpn_conv_cls_weight', init=normal001)
+        rpn_conv_cls_weight = X.var('rpn_conv_cls_weight', init=X.gauss(0.01))
         rpn_conv_cls_bias = X.var('rpn_conv_cls_bias', init=X.zero_init())
-        rpn_conv_bbox_weight = X.var('rpn_conv_bbox_weight', init=normal001)
+        rpn_conv_bbox_weight = X.var('rpn_conv_bbox_weight', init=X.gauss(0.01))
         rpn_conv_bbox_bias = X.var('rpn_conv_bbox_bias', init=X.zero_init())
 
         cls_logit_dict = {}
@@ -69,7 +125,8 @@ class FPNRpnHead(object):
             )
             rpn_relu = X.relu(rpn_conv, name='rpn_relu_%s' % stride)
             if p.fp16:
-                rpn_relu = X.to_fp32(rpn_conv, name="rpn_relu_%s_fp32" % stride)
+                rpn_relu = X.to_fp32(rpn_relu, name="rpn_relu_%s_fp32" % stride)
+
             cls_logit = X.conv(
                 rpn_relu,
                 filter=2 * num_base_anchor,
@@ -96,14 +153,14 @@ class FPNRpnHead(object):
 
         return self.cls_logit_dict, self.bbox_delta_dict
 
-    def get_anchor_target(self, conv_fpn_feat):
-        raise NotImplementedError
-
-    def get_loss(self, conv_fpn_feat, cls_label, bbox_target, bbox_weight):
+    def get_loss(self, conv_fpn_feat, gt_bbox, im_info):
         p = self.p
         batch_image = p.batch_image
-        image_anchor = p.anchor_generate.image_anchor
+        image_anchor = p.anchor_assign.image_anchor
         rpn_stride = p.anchor_generate.stride
+        anchor_scale = p.anchor_generate.scale
+        anchor_ratio = p.anchor_generate.ratio
+        num_anchor = len(p.anchor_generate.ratio) * len(p.anchor_generate.scale)
 
         cls_logit_dict, bbox_delta_dict = self.get_output(conv_fpn_feat)
 
@@ -111,22 +168,48 @@ class FPNRpnHead(object):
 
         rpn_cls_logit_list = []
         rpn_bbox_delta_list = []
+        feat_list = []
 
         for stride in rpn_stride:
             rpn_cls_logit = cls_logit_dict[stride]
             rpn_bbox_delta = bbox_delta_dict[stride]
-            rpn_cls_logit_reshape = X.reshape(data=rpn_cls_logit,
-                                              shape=(0, 2, -1),
-                                              name="rpn_cls_score_reshape_stride%s" % stride)
-            rpn_bbox_delta_reshape = X.reshape(data=rpn_bbox_delta,
-                                              shape=(0, 0, -1),
-                                              name="rpn_bbox_pred_reshape_stride%s" % stride)
+            rpn_cls_logit_reshape = X.reshape(
+                data=rpn_cls_logit,
+                shape=(0, 2, num_anchor, -1),
+                name="rpn_cls_score_reshape_stride%s" % stride
+            )
+            rpn_bbox_delta_reshape = X.reshape(
+                data=rpn_bbox_delta,
+                shape=(0, 0, -1),
+                name="rpn_bbox_pred_reshape_stride%s" % stride
+            )
             rpn_bbox_delta_list.append(rpn_bbox_delta_reshape)
             rpn_cls_logit_list.append(rpn_cls_logit_reshape)
+            feat_list.append(rpn_cls_logit)
+
+        if p.nnvm_rpn_target:
+            from mxnext.tvm.rpn_target import _fpn_rpn_target_batch
+
+            anchor_list = [self.anchor_dict["stride%s" % s] for s in rpn_stride]
+            gt_bbox = mx.sym.slice_axis(gt_bbox, axis=-1, begin=0, end=4)
+
+            max_side = p.anchor_generate.max_side
+            allowed_border = p.anchor_assign.allowed_border
+            fg_fraction = p.anchor_assign.pos_fraction
+            fg_thr = p.anchor_assign.pos_thr
+            bg_thr = p.anchor_assign.neg_thr
+
+            cls_label, bbox_target, bbox_weight = _fpn_rpn_target_batch(
+                mx.sym, feat_list, anchor_list, gt_bbox, im_info, batch_image, num_anchor,
+                max_side, rpn_stride, allowed_border, image_anchor, fg_fraction, fg_thr, bg_thr)
+        else:
+            cls_label = X.var("rpn_cls_label")
+            bbox_target = X.var("rpn_reg_target")
+            bbox_weight = X.var("rpn_reg_weight")
 
         # concat output of each level
         rpn_bbox_delta_concat = X.concat(rpn_bbox_delta_list, axis=2, name="rpn_bbox_pred_concat")
-        rpn_cls_logit_concat = X.concat(rpn_cls_logit_list, axis=2, name="rpn_cls_score_concat")
+        rpn_cls_logit_concat = X.concat(rpn_cls_logit_list, axis=-1, name="rpn_cls_score_concat")
 
         cls_loss = X.softmax_output(
             data=rpn_cls_logit_concat,
@@ -151,7 +234,7 @@ class FPNRpnHead(object):
             grad_scale=1.0 / (batch_image * image_anchor) * scale_loss_shift,
             name='rpn_reg_loss'
         )
-        return cls_loss, reg_loss
+        return cls_loss, reg_loss, X.stop_grad(cls_label, "rpn_cls_label_blockgrad")
 
     def get_all_proposal(self, conv_fpn_feat, im_info):
         if self._proposal is not None:
@@ -166,6 +249,7 @@ class FPNRpnHead(object):
         nms_thr = p.proposal.nms_thr
         min_bbox_side = p.proposal.min_bbox_side
         num_anchors = len(p.anchor_generate.ratio) * len(p.anchor_generate.scale)
+        batch_size = p.batch_image
 
         cls_logit_dict, bbox_delta_dict = self.get_output(conv_fpn_feat)
 
@@ -201,6 +285,30 @@ class FPNRpnHead(object):
                 rpn_min_size=min_bbox_side,
                 threshold=nms_thr,
                 iou_loss=False)
+
+            if p.nnvm_proposal and stride < rpn_stride[-2]:
+                max_side = p.anchor_generate.max_side
+                assert max_side is not None, "nnvm proposal requires max_side of image"
+
+                from mxnext.tvm.proposal import proposal as Proposal
+                anchors = self.anchor_dict["stride%s" % stride]
+                rpn_proposal, rpn_proposal_scores = Proposal(
+                    cls_prob=rpn_cls_score_reshape,
+                    bbox_pred=rpn_bbox_delta,
+                    im_info=im_info,
+                    anchors=anchors,
+                    name='proposal',
+                    feature_stride=stride,
+                    scales=tuple(anchor_scale),
+                    ratios=tuple(anchor_ratio),
+                    rpn_pre_nms_top_n=pre_nms_top_n,
+                    rpn_post_nms_top_n=post_nms_top_n,
+                    threshold=nms_thr,
+                    batch_size=batch_size,
+                    max_side=max_side,
+                    output_score=True,
+                    variant="simpledet"
+                )
             proposal_list.append(rpn_proposal)
             proposal_scores_list.append(rpn_proposal_scores)
 
@@ -208,9 +316,9 @@ class FPNRpnHead(object):
         proposal_concat = X.concat(proposal_list, axis=1, name="proposal_concat")
         proposal_scores_concat = X.concat(proposal_scores_list, axis=1, name="proposal_scores_concat")
 
-        proposal = mx.symbol.Custom(rois=proposal_concat, rois_scores=proposal_scores_concat,
-                                    op_type='get_top_proposal', rpn_post_nms_top_n=post_nms_top_n)
-
+        from mxnext.tvm.get_top_proposal import get_top_proposal
+        proposal = get_top_proposal(mx.symbol, bbox=proposal_concat, score=proposal_scores_concat,
+                                    top_n=post_nms_top_n, batch_size=batch_size)
         self._proposal = proposal
 
         return proposal
@@ -234,7 +342,7 @@ class FPNRpnHead(object):
         bbox_target_mean = p.bbox_target.mean
         bbox_target_std = p.bbox_target.std
 
-        proposal = self.get_all_proposal(conv_fpn_feat, im_info)
+        (proposal, proposal_score) = self.get_all_proposal(conv_fpn_feat, im_info)
 
         (bbox, label, bbox_target, bbox_weight) = X.proposal_target(
             rois=proposal,
@@ -263,7 +371,7 @@ class FPNRpnHead(object):
 
 class MSRAResNet50V1FPN(Backbone):
     def __init__(self, pBackbone):
-        super(MSRAResNet50V1FPN, self).__init__(pBackbone)
+        super().__init__(pBackbone)
         from mxnext.backbone.resnet_v1 import Builder
         b = Builder()
         self.symbol = b.get_backbone("msra", 50, "fpn", pBackbone.normalizer, pBackbone.fp16)
@@ -277,7 +385,7 @@ class MSRAResNet50V1FPN(Backbone):
 
 class MSRAResNet101V1FPN(Backbone):
     def __init__(self, pBackbone):
-        super(MSRAResNet101V1FPN, self).__init__(pBackbone)
+        super().__init__(pBackbone)
         from mxnext.backbone.resnet_v1 import Builder
         b = Builder()
         self.symbol = b.get_backbone("msra", 101, "fpn", pBackbone.normalizer, pBackbone.fp16)
@@ -289,160 +397,193 @@ class MSRAResNet101V1FPN(Backbone):
         return self.symbol
 
 
-class Neck(object):
-    def __init__(self):
-        pass
-
-    def get_rpn_feature(self, rpn_feat):
-        return rpn_feat
-
-    def get_rcnn_feature(self, rcnn_feat):
-        return rcnn_feat
-
-
-class FPNConvTopDown(Neck):
+class FPNNeck(Neck):
     def __init__(self, pNeck):
-        super(FPNConvTopDown, self).__init__()
+        super().__init__(pNeck)
         self.fpn_feat = None
-        self.p = pNeck
 
-    def fpn_conv_down(self, data):
-        if self.fpn_feat:
+    def add_norm(self, sym):
+        p = self.p
+        if p.normalizer.__name__ == "fix_bn":
+            pass
+        elif p.normalizer.__name__ in ["sync_bn", "local_bn", "gn", "dummy"]:
+            sym = p.normalizer(sym)
+        else:
+            raise NotImplementedError("Unsupported normalizer: {}".format(p.normalizer.__name__))
+        return sym
+
+    def fpn_neck(self, data):
+        if self.fpn_feat is not None:
             return self.fpn_feat
 
         c2, c3, c4, c5 = data
 
-        if self.p.fp16:
-            c2 = X.to_fp32(c2, name="c2_to_fp32")
-            c3 = X.to_fp32(c3, name="c3_to_fp32")
-            c4 = X.to_fp32(c4, name="c4_to_fp32")
-            c5 = X.to_fp32(c5, name="c5_to_fp32")
-
         xavier_init = mx.init.Xavier(factor_type="in", rnd_type="uniform", magnitude=3)
 
         # P5
-        p5 = X.conv(data=c5,
-                    filter=256,
-                    no_bias=False,
-                    weight=X.var(name="P5_lateral_weight", init=xavier_init),
-                    bias=X.var(name="P5_lateral_bias", init=X.zero_init()),
-                    name="P5_lateral")
-        p5_conv = X.conv(data=p5,
-                         kernel=3,
-                         filter=256,
-                         no_bias=False,
-                         weight=X.var(name="P5_conv_weight", init=xavier_init),
-                         bias=X.var(name="P5_conv_bias", init=X.zero_init()),
-                         name="P5_conv")
+        p5 = X.conv(
+            data=c5,
+            filter=256,
+            no_bias=False,
+            weight=X.var(name="P5_lateral_weight", init=xavier_init),
+            bias=X.var(name="P5_lateral_bias", init=X.zero_init()),
+            name="P5_lateral"
+        )
+        p5 = self.add_norm(p5)
+        p5_conv = X.conv(
+            data=p5,
+            kernel=3,
+            filter=256,
+            no_bias=False,
+            weight=X.var(name="P5_conv_weight", init=xavier_init),
+            bias=X.var(name="P5_conv_bias", init=X.zero_init()),
+            name="P5_conv"
+        )
+        p5_conv = self.add_norm(p5_conv)
 
         # P4
-        p5_up = mx.sym.UpSampling(p5, scale=2, sample_type="nearest", name="P5_upsampling", num_args=1)
-        p4_la = X.conv(data=c4,
-                       filter=256,
-                       no_bias=False,
-                       weight=X.var(name="P4_lateral_weight", init=xavier_init),
-                        bias=X.var(name="P4_lateral_bias", init=X.zero_init()),
-                       name="P4_lateral")
-        p5_clip = mx.sym.Crop(*[p5_up, p4_la], name="P4_clip")
-        p4 = mx.sym.ElementWiseSum(*[p5_clip, p4_la], name="P4_sum")
+        p5_up = mx.sym.UpSampling(
+            p5,
+            scale=2,
+            sample_type="nearest",
+            name="P5_upsampling",
+            num_args=1
+        )
+        p4_la = X.conv(
+            data=c4,
+            filter=256,
+            no_bias=False,
+            weight=X.var(name="P4_lateral_weight", init=xavier_init),
+            bias=X.var(name="P4_lateral_bias", init=X.zero_init()),
+            name="P4_lateral"
+        )
+        p4_la = self.add_norm(p4_la)
+        p5_clip = mx.sym.slice_like(p5_up, p4_la, name="P4_clip")
+        p4 = mx.sym.add_n(p5_clip, p4_la, name="P4_sum")
 
-        p4_conv = X.conv(data=p4,
-                         kernel=3,
-                         filter=256,
-                         no_bias=False,
-                         weight=X.var(name="P4_conv_weight", init=xavier_init),
-                         bias=X.var(name="P4_conv_bias", init=X.zero_init()),
-                         name="P4_conv")
+        p4_conv = X.conv(
+            data=p4,
+            kernel=3,
+            filter=256,
+            no_bias=False,
+            weight=X.var(name="P4_conv_weight", init=xavier_init),
+            bias=X.var(name="P4_conv_bias", init=X.zero_init()),
+            name="P4_conv"
+        )
+        p4_conv = self.add_norm(p4_conv)
 
         # P3
-        p4_up = mx.sym.UpSampling(p4, scale=2, sample_type="nearest", name="P4_upsampling", num_args=1)
-        p3_la = X.conv(data=c3,
-                       filter=256,
-                       no_bias=False,
-                       weight=X.var(name="P3_lateral_weight", init=xavier_init),
-                       bias=X.var(name="P3_lateral_bias", init=X.zero_init()),
-                       name="P3_lateral")
-        p4_clip = mx.sym.Crop(*[p4_up, p3_la], name="P3_clip")
-        p3 = mx.sym.ElementWiseSum(*[p4_clip, p3_la], name="P3_sum")
+        p4_up = mx.sym.UpSampling(
+            p4,
+            scale=2,
+            sample_type="nearest",
+            name="P4_upsampling",
+            num_args=1
+        )
+        p3_la = X.conv(
+            data=c3,
+            filter=256,
+            no_bias=False,
+            weight=X.var(name="P3_lateral_weight", init=xavier_init),
+            bias=X.var(name="P3_lateral_bias", init=X.zero_init()),
+            name="P3_lateral"
+        )
+        p3_la = self.add_norm(p3_la)
+        p4_clip = mx.sym.slice_like(p4_up, p3_la, name="P3_clip")
+        p3 = mx.sym.add_n(p4_clip, p3_la, name="P3_sum")
 
-        p3_conv = X.conv(data=p3,
-                         kernel=3,
-                         filter=256,
-                         no_bias=False,
-                         weight=X.var(name="P3_conv_weight", init=xavier_init),
-                         bias=X.var(name="P3_conv_bias", init=X.zero_init()),
-                         name="P3_conv")
+        p3_conv = X.conv(
+            data=p3,
+            kernel=3,
+            filter=256,
+            no_bias=False,
+            weight=X.var(name="P3_conv_weight", init=xavier_init),
+            bias=X.var(name="P3_conv_bias", init=X.zero_init()),
+            name="P3_conv"
+        )
+        p3_conv = self.add_norm(p3_conv)
 
         # P2
-        p3_up = mx.sym.UpSampling(p3, scale=2, sample_type="nearest", name="P3_upsampling", num_args=1)
-        p2_la = X.conv(data=c2,
-                       filter=256,
-                       no_bias=False,
-                       weight=X.var(name="P2_lateral_weight", init=xavier_init),
-                       bias=X.var(name="P2_lateral_bias", init=X.zero_init()),
-                       name="P2_lateral")
-        p3_clip = mx.sym.Crop(*[p3_up, p2_la], name="P2_clip")
-        p2 = mx.sym.ElementWiseSum(*[p3_clip, p2_la], name="P2_sum")
+        p3_up = mx.sym.UpSampling(
+            p3,
+            scale=2,
+            sample_type="nearest",
+            name="P3_upsampling",
+            num_args=1
+        )
+        p2_la = X.conv(
+            data=c2,
+            filter=256,
+            no_bias=False,
+            weight=X.var(name="P2_lateral_weight", init=xavier_init),
+            bias=X.var(name="P2_lateral_bias", init=X.zero_init()),
+            name="P2_lateral"
+        )
+        p2_la = self.add_norm(p2_la)
+        p3_clip = mx.sym.slice_like(p3_up, p2_la, name="P2_clip")
+        p2 = mx.sym.add_n(p3_clip, p2_la, name="P2_sum")
 
-        p2_conv = X.conv(data=p2,
-                         kernel=3,
-                         filter=256,
-                         no_bias=False,
-                         weight=X.var(name="P2_conv_weight", init=xavier_init),
-                         bias=X.var(name="P2_conv_bias", init=X.zero_init()),
-                         name="P2_conv")
+        p2_conv = X.conv(
+            data=p2,
+            kernel=3,
+            filter=256,
+            no_bias=False,
+            weight=X.var(name="P2_conv_weight", init=xavier_init),
+            bias=X.var(name="P2_conv_bias", init=X.zero_init()),
+            name="P2_conv"
+        )
+        p2_conv = self.add_norm(p2_conv)
 
         # P6
-        p6 = X.pool(p5_conv, name="P6_subsampling", kernel=1, stride=2, pad=0, pool_type='max')
-        if self.p.fp16:
-            p6 = X.to_fp16(p6, name="p6_to_fp16")
-            p5_conv = X.to_fp16(p5_conv, name="p5_conv_to_fp16")
-            p4_conv = X.to_fp16(p4_conv, name="p4_conv_to_fp16")
-            p3_conv = X.to_fp16(p3_conv, name="p3_conv_to_fp16")
-            p2_conv = X.to_fp16(p2_conv, name="p2_conv_to_fp16")
+        p6 = X.max_pool(
+            p5_conv,
+            name="P6_subsampling",
+            kernel=1,
+            stride=2,
+        )
 
-        conv_fpn_feat = dict()
-        conv_fpn_feat.update({"stride64": p6, "stride32": p5_conv, "stride16": p4_conv, "stride8": p3_conv, "stride4": p2_conv})
+        conv_fpn_feat = dict(
+            stride64=p6,
+            stride32=p5_conv,
+            stride16=p4_conv,
+            stride8=p3_conv,
+            stride4=p2_conv
+        )
 
         self.fpn_feat = conv_fpn_feat
         return self.fpn_feat
 
     def get_rpn_feature(self, rpn_feat):
-        return self.fpn_conv_down(rpn_feat)
+        return self.fpn_neck(rpn_feat)
 
     def get_rcnn_feature(self, rcnn_feat):
-        return self.fpn_conv_down(rcnn_feat)
+        return self.fpn_neck(rcnn_feat)
 
 
-class FPNRoiExtractor(object):
+class FPNRoiAlign(RoiAlign):
     def __init__(self, pRoi):
-        self.p = pRoi  # type: RoiParam
-
-    def get_roi_feature(self, rcnn_feat, proposal):
-        pass
-
-
-class FPNRoiAlign(FPNRoiExtractor):
-    def __init__(self, pRoi):
-        super(FPNRoiAlign, self).__init__(pRoi)
-
-    def get_roi_feature_test(self, conv_fpn_feat, proposals):
-        return self.get_roi_feature(conv_fpn_feat, proposals)
+        super().__init__(pRoi)
 
     def get_roi_feature(self, conv_fpn_feat, proposal):
         p = self.p
         rcnn_stride = p.stride
+        roi_canonical_scale = p.roi_canonical_scale
+        roi_canonical_level = p.roi_canonical_level
 
-        group = mx.symbol.Custom(rois=proposal, op_type='assign_layer_fpn')
+        from mxnext.tvm.fpn_roi_assign import fpn_roi_assign
+        group = fpn_roi_assign(mx.symbol, proposal, rcnn_stride,
+            roi_canonical_scale, roi_canonical_level)
+
         proposal_fpn = dict()
-        proposal_fpn["stride4"] = group[1]
-        proposal_fpn["stride8"] = group[2]
-        proposal_fpn["stride16"] = group[3]
-        proposal_fpn["stride32"] = group[4]
+        for i, stride in enumerate(rcnn_stride):
+            proposal_fpn["stride%s" % stride] = group[i]
 
         if p.fp16:
             for stride in rcnn_stride:
-                conv_fpn_feat["stride%s" % stride] = X.to_fp32(conv_fpn_feat["stride%s" % stride], name="fpn_stride%s_to_fp32")
+                conv_fpn_feat["stride%s" % stride] = X.to_fp32(
+                    conv_fpn_feat["stride%s" % stride],
+                    name="fpn_stride%s_to_fp32"
+                )
 
         fpn_roi_feats = list()
         for stride in rcnn_stride:
@@ -455,7 +596,11 @@ class FPNRoiAlign(FPNRoiExtractor):
                 stride=stride,
                 name="roi_align"
             )
-            roi_feat = X.reshape(data=roi_feat, shape=(-3, -2), name='roi_feat_reshape')
+            roi_feat = X.reshape(
+                data=roi_feat,
+                shape=(-3, -2),
+                name='roi_feat_reshape'
+            )
             fpn_roi_feats.append(roi_feat)
         roi_feat = X.add_n(*fpn_roi_feats)
 

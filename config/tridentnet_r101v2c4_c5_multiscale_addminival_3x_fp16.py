@@ -1,7 +1,7 @@
 from models.tridentnet.builder import TridentFasterRcnn as Detector
 from models.tridentnet.builder import TridentMXNetResNetV2 as Backbone
 from models.tridentnet.builder import TridentRpnHead as RpnHead
-from models.tridentnet.builder import process_branch_outputs
+from models.tridentnet.builder import process_branch_outputs, process_branch_rpn_outputs
 from symbol.builder import Neck
 from symbol.builder import RoiAlign as RoiExtractor
 from symbol.builder import BboxC5Head as BboxHead
@@ -56,7 +56,7 @@ def get_config(is_train):
 
     class RpnParam:
         fp16 = General.fp16
-        normalizer = NormalizeParam.normalizer
+        normalizer = normalizer_factory(type="fixbn")  # old model does not use BN in RPN head
         batch_image = General.batch_image * Trident.num_branch
 
         class anchor_generate:
@@ -114,10 +114,10 @@ def get_config(is_train):
 
     class DatasetParam:
         if is_train:
-            image_set = ("coco_train2014", "coco_valminusminival2014", "coco_minival2014")
+            image_set = ("coco_train2017", "coco_val2017")
         else:
             image_set = ("coco_test-dev2017", )
-            # image_set = ("coco_minival2014", )
+            # image_set = ("coco_val2017", )
 
     backbone = Backbone(BackboneParam)
     neck = Neck(NeckParam)
@@ -129,9 +129,11 @@ def get_config(is_train):
         train_sym = detector.get_train_symbol(
             backbone, neck, rpn_head, roi_extractor, bbox_head,
             num_branch=Trident.num_branch, scaleaware=Trident.train_scaleaware)
+        rpn_test_sym = None
         test_sym = None
     else:
         train_sym = None
+        rpn_test_sym = detector.get_rpn_test_symbol(backbone, neck, rpn_head, Trident.num_branch)
         test_sym = detector.get_test_symbol(
             backbone, neck, rpn_head, roi_extractor, bbox_head, num_branch=Trident.num_branch)
 
@@ -139,6 +141,7 @@ def get_config(is_train):
     class ModelParam:
         train_symbol = train_sym
         test_symbol = test_sym
+        rpn_test_symbol = rpn_test_sym
 
         from_scratch = False
         random = True
@@ -281,7 +284,7 @@ def get_config(is_train):
         mapping = dict(image="data")
 
 
-    from core.detection_input import ReadRoiRecord,  RandResize2DImageBbox, RandCrop2DImageBbox, Resize2DImageBboxByRoidb, \
+    from core.detection_input import ReadRoiRecord,  RandResize2DImageBbox, RandCrop2DImageBbox, Resize2DImageByRoidb, \
         ConvertImageFromHwcToChw, Flip2DImageBbox, Pad2DImageBbox, \
         RenameRecord
     from models.tridentnet.input import ScaleAwareRange, TridentAnchorTarget2D
@@ -305,7 +308,7 @@ def get_config(is_train):
     else:
         transform = [
             ReadRoiRecord(None),
-            Resize2DImageBboxByRoidb(),
+            Resize2DImageByRoidb(),
             ConvertImageFromHwcToChw(),
             RenameRecord(RenameParam.mapping)
         ]

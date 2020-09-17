@@ -1,11 +1,12 @@
-from models.FPN.builder import MSRAResNet50V1FPN as FPNBackbone
-from models.FPN.builder import FPNConvTopDown
-from models.FPN.builder import FPNRoiAlign as FPNRoiExtractor
-from models.FPN.builder import FPNBbox2fcHead as Bbox2fcHead
+from symbol.builder import add_anchor_to_arg
+from models.FPN.builder import MSRAResNet50V1FPN as Backbone
+from models.FPN.builder import FPNNeck as Neck
+from models.FPN.builder import FPNRoiAlign as RoiExtractor
+from models.FPN.builder import FPNBbox2fcHead as BboxHead
 from mxnext.complicate import normalizer_factory
 
 from models.maskrcnn.builder import MaskFasterRcnn as Detector
-from models.maskrcnn.builder import MaskFPNRpnHead as FPNRpnHead
+from models.maskrcnn.builder import MaskFPNRpnHead as RpnHead
 from models.maskrcnn.builder import MaskFasterRcnn4ConvHead as MaskHead
 from models.maskrcnn.builder import BboxPostProcessor
 from models.maskrcnn.process_output import process_output
@@ -17,6 +18,7 @@ def get_config(is_train):
         name = __name__.rsplit("/")[-1].rsplit(".")[-1]
         batch_image = 2 if is_train else 1
         fp16 = False
+        loader_worker = 8
 
 
     class KvstoreParam:
@@ -44,12 +46,23 @@ def get_config(is_train):
         fp16 = General.fp16
         normalizer = NormalizeParam.normalizer
         batch_image = General.batch_image
+        nnvm_proposal = True
+        nnvm_rpn_target = False
 
         class anchor_generate:
             scale = (8,)
             ratio = (0.5, 1.0, 2.0)
-            stride = [64, 32, 16, 8, 4]
+            stride = (4, 8, 16, 32, 64)
             image_anchor = 256
+            max_side = 1400
+
+        class anchor_assign:
+            allowed_border = 0
+            pos_thr = 0.7
+            neg_thr = 0.3
+            min_pos_thr = 0.0
+            image_anchor = 256
+            pos_fraction = 0.5
 
         class head:
             conv_channel = 256
@@ -96,27 +109,32 @@ def get_config(is_train):
         normalizer  = NormalizeParam.normalizer
         resolution  = 28
         dim_reduced = 256
+        num_fg_roi  = int(RpnParam.subsample_proposal.image_roi * RpnParam.subsample_proposal.fg_fraction)
 
 
     class RoiParam:
         fp16 = General.fp16
         normalizer = NormalizeParam.normalizer
         out_size = 7
-        stride = [32, 16, 8, 4]
+        stride = (4, 8, 16, 32)
+        roi_canonical_scale = 224
+        roi_canonical_level = 4
 
 
     class MaskRoiParam:
         fp16 = General.fp16
         normalizer = NormalizeParam.normalizer
         out_size = 14
-        stride = [32, 16, 8, 4]
+        stride = (4, 8, 16, 32)
+        roi_canonical_scale = 224
+        roi_canonical_level = 4
 
 
     class DatasetParam:
         if is_train:
-            image_set = ("coco_train2014", "coco_valminusminival2014")
+            image_set = ("coco_train2017", )
         else:
-            image_set = ("coco_minival2014", )
+            image_set = ("coco_val2017", )
 
 
     class OptimizeParam:
@@ -128,10 +146,11 @@ def get_config(is_train):
             clip_gradient = None
 
         class schedule:
+            mult = 1
             begin_epoch = 0
-            end_epoch = 6
-            lr_iter = [60000 * 16 // (len(KvstoreParam.gpus) * KvstoreParam.batch_image),
-                       80000 * 16 // (len(KvstoreParam.gpus) * KvstoreParam.batch_image)]
+            end_epoch = 6 * mult
+            lr_iter = [60000 * mult * 16 // (len(KvstoreParam.gpus) * KvstoreParam.batch_image),
+                       80000 * mult * 16 // (len(KvstoreParam.gpus) * KvstoreParam.batch_image)]
 
         class warmup:
             type = "gradual"
@@ -148,7 +167,7 @@ def get_config(is_train):
 
         class model:
             prefix = "experiments/{}/checkpoint".format(General.name)
-            epoch = 6
+            epoch = OptimizeParam.schedule.end_epoch
 
         class nms:
             type = "nms"
@@ -157,12 +176,12 @@ def get_config(is_train):
         class coco:
             annotation = "data/coco/annotations/instances_minival2014.json"
 
-    backbone = FPNBackbone(BackboneParam)
-    neck = FPNConvTopDown(NeckParam)
-    rpn_head = FPNRpnHead(RpnParam, MaskParam)
-    roi_extractor = FPNRoiExtractor(RoiParam)
-    mask_roi_extractor = FPNRoiExtractor(MaskRoiParam)
-    bbox_head = Bbox2fcHead(BboxParam)
+    backbone = Backbone(BackboneParam)
+    neck = Neck(NeckParam)
+    rpn_head = RpnHead(RpnParam, MaskParam)
+    roi_extractor = RoiExtractor(RoiParam)
+    mask_roi_extractor = RoiExtractor(MaskRoiParam)
+    bbox_head = BboxHead(BboxParam)
     mask_head = MaskHead(BboxParam, MaskParam, MaskRoiParam)
     bbox_post_processer = BboxPostProcessor(TestParam)
     detector = Detector()
@@ -187,7 +206,14 @@ def get_config(is_train):
             prefix = "pretrain_model/resnet-v1-50"
             epoch = 0
             fixed_param = ["conv0", "stage1", "gamma", "beta"]
+            excluded_param = ["mask_fcn"]
 
+        def process_weight(sym, arg, aux):
+            for stride in RpnParam.anchor_generate.stride:
+                add_anchor_to_arg(
+                    sym, arg, aux, RpnParam.anchor_generate.max_side,
+                    stride, RpnParam.anchor_generate.scale,
+                    RpnParam.anchor_generate.ratio)
 
 
     # data processing
@@ -254,11 +280,13 @@ def get_config(is_train):
             EncodeGtPoly(PadParam),
             Pad2DImageBboxMask(PadParam),
             ConvertImageFromHwcToChw(),
-            PyramidAnchorTarget2D(AnchorTarget2DParam()),
             RenameRecord(RenameParam.mapping)
         ]
-        data_name = ["data", "im_info", "gt_bbox", "gt_poly"]
-        label_name = ["rpn_cls_label", "rpn_reg_target", "rpn_reg_weight"]
+        data_name = ["data"]
+        label_name = ["im_info", "gt_bbox", "gt_poly"]
+        if not RpnParam.nnvm_rpn_target:
+            transform.append(PyramidAnchorTarget2D(AnchorTarget2DParam()))
+            label_name += ["rpn_cls_label", "rpn_reg_target", "rpn_reg_weight"]
     else:
         transform = [
             ReadRoiRecord(None),
@@ -275,13 +303,13 @@ def get_config(is_train):
 
     rpn_acc_metric = metric.AccWithIgnore(
         "RpnAcc",
-        ["rpn_cls_loss_output"],
-        ["rpn_cls_label"]
+        ["rpn_cls_loss_output", "rpn_cls_label_blockgrad_output"],
+        []
     )
     rpn_l1_metric = metric.L1(
         "RpnL1",
-        ["rpn_reg_loss_output"],
-        ["rpn_cls_label"]
+        ["rpn_reg_loss_output", "rpn_cls_label_blockgrad_output"],
+        []
     )
     # for bbox, the label is generated in network so it is an output
     box_acc_metric = metric.AccWithIgnore(
@@ -300,7 +328,7 @@ def get_config(is_train):
         []
     )
 
-    metric_list = [rpn_acc_metric, rpn_l1_metric, box_acc_metric, box_l1_metric, mask_cls_metric]
+    metric_list = [rpn_acc_metric, rpn_l1_metric, box_acc_metric, box_l1_metric,]
 
     return General, KvstoreParam, RpnParam, RoiParam, BboxParam, DatasetParam, \
            ModelParam, OptimizeParam, TestParam, \

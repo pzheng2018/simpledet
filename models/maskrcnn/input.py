@@ -20,7 +20,7 @@ class Resize2DImageBboxMask(DetectionAugmentation):
     """
 
     def __init__(self, pResize):
-        super(Resize2DImageBboxMask, self).__init__()
+        super().__init__()
         self.p = pResize  # type: ResizeParam
 
     def apply(self, input_record):
@@ -38,17 +38,13 @@ class Resize2DImageBboxMask(DetectionAugmentation):
                                            interpolation=cv2.INTER_LINEAR)
         # make sure gt boxes do not overflow
         gt_bbox[:, :4] = gt_bbox[:, :4] * scale
-        if image.shape[0] < image.shape[1]:
-            gt_bbox[:, [0, 2]] = np.clip(gt_bbox[:, [0, 2]], 0, p.long)
-            gt_bbox[:, [1, 3]] = np.clip(gt_bbox[:, [1, 3]], 0, p.short)
-        else:
-            gt_bbox[:, [0, 2]] = np.clip(gt_bbox[:, [0, 2]], 0, p.short)
-            gt_bbox[:, [1, 3]] = np.clip(gt_bbox[:, [1, 3]], 0, p.long)
+        gt_bbox[:, [0, 2]] = np.clip(gt_bbox[:, [0, 2]], 0, input_record["image"].shape[1] - 1)
+        gt_bbox[:, [1, 3]] = np.clip(gt_bbox[:, [1, 3]], 0, input_record["image"].shape[0] - 1)
         input_record["gt_bbox"] = gt_bbox
 
         # exactly as opencv
         h, w = image.shape[:2]
-        input_record["im_info"] = (round(h * scale), round(w * scale), scale)
+        input_record["im_info"] = np.array([round(h * scale), round(w * scale), scale], dtype=np.float32)
 
         # resize poly
         for i, segms in enumerate(gt_poly):
@@ -66,7 +62,7 @@ class Flip2DImageBboxMask(DetectionAugmentation):
     """
 
     def __init__(self):
-        super(Flip2DImageBboxMask, self).__init__()
+        super().__init__()
 
     def apply(self, input_record):
         def _flip_poly(poly, width):
@@ -102,7 +98,7 @@ class Pad2DImageBboxMask(DetectionAugmentation):
     """
 
     def __init__(self, pPad):
-        super(Pad2DImageBboxMask, self).__init__()
+        super().__init__()
         self.p = pPad  # type: PadParam
 
     def apply(self, input_record):
@@ -137,7 +133,7 @@ class PreprocessGtPoly(DetectionAugmentation):
     """
 
     def __init__(self):
-        super(PreprocessGtPoly, self).__init__()
+        super().__init__()
 
     def apply(self, input_record):
         ins_poly = input_record["gt_poly"]
@@ -157,7 +153,7 @@ class EncodeGtPoly(DetectionAugmentation):
     """
 
     def __init__(self, pPad):
-        super(EncodeGtPoly, self).__init__()
+        super().__init__()
         self.p = pPad
 
     def apply(self, input_record):
@@ -180,7 +176,7 @@ class EncodeGtPoly(DetectionAugmentation):
 
 
 if __name__ == "__main__":
-    import six.moves.cPickle as pkl
+    import pickle as pkl
     import time
 
     import pycocotools.mask as mask_util

@@ -30,7 +30,6 @@ inline void SampleROI(const Tensor<cpu, 2, DType> &all_rois,
                       const float fg_thresh,
                       const float bg_thresh_hi,
                       const float bg_thresh_lo,
-                      const int image_rois,
                       const bool class_agnostic,
                       Tensor<cpu, 2, DType> &&rois,
                       Tensor<cpu, 1, DType> &&labels,
@@ -77,19 +76,16 @@ inline void SampleROI(const Tensor<cpu, 2, DType> &all_rois,
       neg_indexes.push_back(i);
     }
   }
-  // when image_rois != -1, subsampling rois
+  // subsampling rois
   index_t fg_rois_this_image;
-  if (image_rois != -1)
-    fg_rois_this_image = min<index_t>(fg_rois_per_image, fg_indexes.size());
-  else
-    fg_rois_this_image = fg_indexes.size();
+  fg_rois_this_image = min<index_t>(fg_rois_per_image, fg_indexes.size());
   if (fg_indexes.size() > fg_rois_this_image) {
     random_shuffle(begin(fg_indexes), end(fg_indexes));
     fg_indexes.resize(fg_rois_this_image);
   }
 
   /*
-  bg_indexes = np.where((overlaps < config.TRAIN.BG_THRESH_HI) & (overlaps >= config.TRAIN.BG_THRESH_LO))[0] 
+  bg_indexes = np.where((overlaps < config.TRAIN.BG_THRESH_HI) & (overlaps >= config.TRAIN.BG_THRESH_LO))[0]
   bg_rois_per_this_image = rois_per_image - fg_rois_per_this_image
   bg_rois_per_this_image = np.minimum(bg_rois_per_this_image, bg_indexes.size)
   if len(bg_indexes) > bg_rois_per_this_image:
@@ -117,12 +113,11 @@ inline void SampleROI(const Tensor<cpu, 2, DType> &all_rois,
   }
 
   // pad with negative rois, original code is GARBAGE and omitted
-  if (kept_indexes.size() < rois_per_image) {
+  while (kept_indexes.size() < rois_per_image && neg_indexes.size() > 0) {
       index_t gap = rois_per_image - kept_indexes.size();
       random_shuffle(begin(neg_indexes), end(neg_indexes));
-      neg_indexes.resize(gap);
-      for (auto idx: neg_indexes) {
-          kept_indexes.push_back(idx);
+      for (index_t idx = 0;idx < gap && idx < neg_indexes.size();++idx) {
+          kept_indexes.push_back(neg_indexes[idx]);
       }
   }
   /*

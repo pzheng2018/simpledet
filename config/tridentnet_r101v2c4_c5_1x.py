@@ -1,7 +1,7 @@
 from models.tridentnet.builder import TridentFasterRcnn as Detector
 from models.tridentnet.builder import TridentMXNetResNetV2 as Backbone
 from models.tridentnet.builder import TridentRpnHead as RpnHead
-from models.tridentnet.builder import process_branch_outputs
+from models.tridentnet.builder import process_branch_outputs, process_branch_rpn_outputs
 from symbol.builder import Neck
 from symbol.builder import RoiAlign as RoiExtractor
 from symbol.builder import BboxC5Head as BboxHead
@@ -75,7 +75,7 @@ def get_config(is_train):
 
         class proposal:
             pre_nms_top_n = 12000 if is_train else 6000
-            post_nms_top_n = 500 if is_train else 1000
+            post_nms_top_n = 500 if is_train else 300
             nms_thr = 0.7
             min_bbox_side = 0
 
@@ -117,9 +117,9 @@ def get_config(is_train):
 
     class DatasetParam:
         if is_train:
-            image_set = ("coco_train2014", "coco_valminusminival2014")
+            image_set = ("coco_train2017", )
         else:
-            image_set = ("coco_minival2014", )
+            image_set = ("coco_val2017", )
 
     backbone = Backbone(BackboneParam)
     neck = Neck(NeckParam)
@@ -131,9 +131,11 @@ def get_config(is_train):
         train_sym = detector.get_train_symbol(
             backbone, neck, rpn_head, roi_extractor, bbox_head,
             num_branch=Trident.num_branch, scaleaware=Trident.train_scaleaware)
+        rpn_test_sym = None
         test_sym = None
     else:
         train_sym = None
+        rpn_test_sym = detector.get_rpn_test_symbol(backbone, neck, rpn_head, Trident.num_branch)
         test_sym = detector.get_test_symbol(
             backbone, neck, rpn_head, roi_extractor, bbox_head, num_branch=Trident.num_branch)
 
@@ -141,6 +143,7 @@ def get_config(is_train):
     class ModelParam:
         train_symbol = train_sym
         test_symbol = test_sym
+        rpn_test_symbol = rpn_test_sym
 
         from_scratch = False
         random = True
@@ -183,6 +186,8 @@ def get_config(is_train):
                 x, Trident.num_branch, Trident.valid_ranges, Trident.valid_ranges_on_origin)
         else:
             process_output = lambda x, y: x
+
+        process_rpn_output = lambda x, y: process_branch_rpn_outputs(x, Trident.num_branch)
 
         class model:
             prefix = "experiments/{}/checkpoint".format(General.name)

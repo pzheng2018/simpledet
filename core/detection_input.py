@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 import mxnet as mx
 
-from six.moves.queue import Queue
+from queue import Queue
 from threading import Thread
 from operator_py.cython.bbox import bbox_overlaps_cython
 from operator_py.bbox_transform import nonlinear_transform as bbox_transform
@@ -29,12 +29,12 @@ class ReadRoiRecord(DetectionAugmentation):
     """
 
     def __init__(self, gt_select):
-        super(ReadRoiRecord, self).__init__()
+        super().__init__()
         self.gt_select = gt_select
 
     def apply(self, input_record):
         image = cv2.imread(input_record["image_url"], cv2.IMREAD_COLOR)
-        input_record["image"] = image[:, :, ::-1]
+        input_record["image"] = image[:, :, ::-1].astype("float32")
         # TODO: remove this compatibility method
         input_record["gt_bbox"] = np.concatenate([input_record["gt_bbox"],
                                                   input_record["gt_class"].reshape(-1, 1)],
@@ -52,7 +52,7 @@ class Norm2DImage(DetectionAugmentation):
     """
 
     def __init__(self, pNorm):
-        super(Norm2DImage, self).__init__()
+        super().__init__()
         self.p = pNorm  # type: NormParam
 
     def apply(self, input_record):
@@ -76,7 +76,7 @@ class Resize2DImageBbox(DetectionAugmentation):
     """
 
     def __init__(self, pResize):
-        super(Resize2DImageBbox, self).__init__()
+        super().__init__()
         self.p = pResize  # type: ResizeParam
 
     def apply(self, input_record):
@@ -93,20 +93,46 @@ class Resize2DImageBbox(DetectionAugmentation):
                                            interpolation=cv2.INTER_LINEAR)
         # make sure gt boxes do not overflow
         gt_bbox[:, :4] = gt_bbox[:, :4] * scale
-        if image.shape[0] < image.shape[1]:
-            gt_bbox[:, [0, 2]] = np.clip(gt_bbox[:, [0, 2]], 0, p.long)
-            gt_bbox[:, [1, 3]] = np.clip(gt_bbox[:, [1, 3]], 0, p.short)
-        else:
-            gt_bbox[:, [0, 2]] = np.clip(gt_bbox[:, [0, 2]], 0, p.short)
-            gt_bbox[:, [1, 3]] = np.clip(gt_bbox[:, [1, 3]], 0, p.long)
+        gt_bbox[:, [0, 2]] = np.clip(gt_bbox[:, [0, 2]], 0, input_record["image"].shape[1] - 1)
+        gt_bbox[:, [1, 3]] = np.clip(gt_bbox[:, [1, 3]], 0, input_record["image"].shape[0] - 1)
         input_record["gt_bbox"] = gt_bbox
 
         # exactly as opencv
         h, w = image.shape[:2]
-        input_record["im_info"] = (round(h * scale), round(w * scale), scale)
+        input_record["im_info"] = np.array([round(h * scale), round(w * scale), scale], dtype=np.float32)
 
 
-class Resize2DImageBboxByRoidb(DetectionAugmentation):
+class Resize2DImage(DetectionAugmentation):
+    """
+    input: image, ndarray(h, w, rgb)
+           gt_bbox, ndarry(n, 5)
+    output: image, ndarray(h', w', rgb)
+            im_info, tuple(h', w', scale)
+            gt_bbox, ndarray(n, 5)
+    """
+
+    def __init__(self, pResize):
+        super().__init__()
+        self.p = pResize  # type: ResizeParam
+
+    def apply(self, input_record):
+        p = self.p
+
+        image = input_record["image"]
+
+        short = min(image.shape[:2])
+        long = max(image.shape[:2])
+        scale = min(p.short / short, p.long / long)
+
+        input_record["image"] = cv2.resize(image, None, None, scale, scale,
+                                           interpolation=cv2.INTER_LINEAR)
+
+        # exactly as opencv
+        h, w = image.shape[:2]
+        input_record["im_info"] = np.array([round(h * scale), round(w * scale), scale], dtype=np.float32)
+
+
+class Resize2DImageByRoidb(DetectionAugmentation):
     """
     input: image, ndarray(h, w, rgb)
            gt_bbox, ndarry(n, 5)
@@ -116,11 +142,11 @@ class Resize2DImageBboxByRoidb(DetectionAugmentation):
     """
 
     def __init__(self):
-        super(Resize2DImageBboxByRoidb, self).__init__()
+        super().__init__()
         class ResizeParam:
             long = None
             short = None
-        self.resize_aug = Resize2DImageBbox(ResizeParam)
+        self.resize_aug = Resize2DImage(ResizeParam)
 
     def apply(self, input_record):
         self.resize_aug.p.long = input_record["resize_long"]
@@ -139,7 +165,7 @@ class RandResize2DImageBbox(DetectionAugmentation):
     """
 
     def __init__(self, pRandResize):
-        super(RandResize2DImageBbox, self).__init__()
+        super().__init__()
         self.p = pRandResize
         class ResizeParam:
             long = None
@@ -164,7 +190,7 @@ class Flip2DImageBbox(DetectionAugmentation):
     """
 
     def __init__(self):
-        super(Flip2DImageBbox, self).__init__()
+        super().__init__()
 
     def apply(self, input_record):
         if input_record["flipped"]:
@@ -181,7 +207,7 @@ class Flip2DImageBbox(DetectionAugmentation):
 
 class RandCrop2DImageBbox(DetectionAugmentation):
     def __init__(self, pCrop):
-        super(RandCrop2DImageBbox, self).__init__()
+        super().__init__()
         self.p = pCrop
         assert pCrop.mode in ["center", "random"], "The {} crop mode is not supported".format(pCrop.mode)
 
@@ -253,7 +279,7 @@ class RandCrop2DImageBbox(DetectionAugmentation):
 
         input_record["image"] = im_cropped
         input_record["gt_bbox"] = gt_bbox
-        input_record["im_info"] = (crop_h, crop_w, input_record["im_info"][2])
+        input_record["im_info"] = np.array([crop_h, crop_w, input_record["im_info"][2]], dtype=np.float32)
 
 
 class Pad2DImageBbox(DetectionAugmentation):
@@ -265,7 +291,7 @@ class Pad2DImageBbox(DetectionAugmentation):
     """
 
     def __init__(self, pPad):
-        super(Pad2DImageBbox, self).__init__()
+        super().__init__()
         self.p = pPad  # type: PadParam
 
     def apply(self, input_record):
@@ -274,8 +300,9 @@ class Pad2DImageBbox(DetectionAugmentation):
         image = input_record["image"]
         gt_bbox = input_record["gt_bbox"]
 
+        origin_h, origin_w = input_record["h"], input_record["w"]
         h, w = image.shape[:2]
-        shape = (p.long, p.short, 3) if h >= w \
+        shape = (p.long, p.short, 3) if origin_h >= origin_w \
             else (p.short, p.long, 3)
 
         padded_image = np.zeros(shape, dtype=np.float32)
@@ -287,9 +314,37 @@ class Pad2DImageBbox(DetectionAugmentation):
         input_record["gt_bbox"] = padded_gt_bbox
 
 
+class Pad2DImage(DetectionAugmentation):
+    """
+    input: image, ndarray(h, w, rgb)
+           gt_bbox, ndarry(n, 5)
+    output: image, ndarray(h, w, rgb)
+            gt_bbox, ndarray(max_num_gt, 5)
+    """
+
+    def __init__(self, pPad):
+        super().__init__()
+        self.p = pPad  # type: PadParam
+
+    def apply(self, input_record):
+        p = self.p
+
+        image = input_record["image"]
+
+        origin_h, origin_w = input_record["h"], input_record["w"]
+        h, w = image.shape[:2]
+        shape = (p.long, p.short, 3) if origin_h >= origin_w \
+            else (p.short, p.long, 3)
+
+        padded_image = np.zeros(shape, dtype=np.float32)
+        padded_image[:h, :w] = image
+
+        input_record["image"] = padded_image
+
+
 class ConvertImageFromHwcToChw(DetectionAugmentation):
     def __init__(self):
-        super(ConvertImageFromHwcToChw, self).__init__()
+        super().__init__()
 
     def apply(self, input_record):
         input_record["image"] = input_record["image"].transpose((2, 0, 1))
@@ -305,7 +360,7 @@ class AnchorTarget2D(DetectionAugmentation):
     """
 
     def __init__(self, pAnchor):
-        super(AnchorTarget2D, self).__init__()
+        super().__init__()
         self.p = pAnchor  # type: AnchorTarget2DParam
 
         self.__base_anchor = None
@@ -391,8 +446,6 @@ class AnchorTarget2D(DetectionAugmentation):
     def h_all_anchor(self, value):
         self.__h_all_anchor = value
         self.__num_anchor = value.shape[0]
-
-
 
     def _assign_label_to_anchor(self, valid_anchor, gt_bbox, neg_thr, pos_thr, min_pos_thr):
         num_anchor = valid_anchor.shape[0]
@@ -514,7 +567,7 @@ class AnchorTarget2D(DetectionAugmentation):
 
 class RenameRecord(DetectionAugmentation):
     def __init__(self, mapping):
-        super(RenameRecord, self).__init__()
+        super().__init__()
         self.mapping = mapping
 
     def apply(self, input_record):
@@ -532,8 +585,8 @@ class Loader(mx.io.DataIter):
     """
 
     def __init__(self, roidb, transform, data_name, label_name, batch_size=1,
-                 shuffle=False, num_worker=None, num_collector=None, 
-                 worker_queue_depth=None, collector_queue_depth=None, kv=None):
+                 shuffle=False, num_worker=None, num_collector=None,
+                 worker_queue_depth=None, collector_queue_depth=None, valid_count=-1):
         """
         This Iter will provide roi data to Fast R-CNN network
         :param roidb: must be preprocessed
@@ -541,22 +594,23 @@ class Loader(mx.io.DataIter):
         :param shuffle: bool
         :return: Loader
         """
-        super(Loader, self).__init__(batch_size=batch_size)
-
-        if kv:
-            (self.rank, self.num_worker) = (kv.rank, kv.num_workers)
-        else:
-            (self.rank, self.num_worker) = (0, 1)
+        super().__init__(batch_size=batch_size)
 
         # data processing utilities
-        self.transform = transform
+        if isinstance(transform, dict):
+            self.transform = transform["sample"]
+            self.batch_transform = transform["batch"]
+        else:
+            self.transform = transform
+            self.batch_transform = list()
 
         # save parameters as properties
         self.roidb = roidb
         self.shuffle = shuffle
 
         # infer properties from roidb
-        self.index = np.arange(len(roidb))
+        self.total_index = np.arange(len(roidb))
+        self.valid_count = valid_count if valid_count != -1 else len(roidb)
 
         # decide data and label names
         self.data_name = data_name
@@ -567,6 +621,9 @@ class Loader(mx.io.DataIter):
 
         self.data = None
         self.label = None
+
+        self.debug = False
+        self.result = None
 
         # multi-thread settings
         self.num_worker = num_worker
@@ -583,8 +640,12 @@ class Loader(mx.io.DataIter):
         self.reset()
 
     @property
-    def total_record(self):
-        return len(self.index) // self.batch_size * self.batch_size
+    def index(self):
+        return self.total_index[:self.valid_count]
+
+    @property
+    def total_batch(self):
+        return len(self.index) // self.batch_size
 
     @property
     def provide_data(self):
@@ -618,7 +679,7 @@ class Loader(mx.io.DataIter):
     def reset(self):
         self._cur = 0
         if self.shuffle:
-            np.random.shuffle(self.index)
+            np.random.shuffle(self.total_index)
 
         self._insert_queue()
 
@@ -635,12 +696,16 @@ class Loader(mx.io.DataIter):
         return result
 
     def next(self):
+        if self.debug and self.result is not None:
+            return self.result
+
         if self.iter_next():
             # print("[worker] %d" % self.data_queue.qsize())
             # print("[collector] %d" % self.result_queue.qsize())
             result = self.load_batch()
             self.data = result.data
             self.label = result.label
+            self.result = result
             return result
         else:
             raise StopIteration
@@ -657,14 +722,16 @@ class Loader(mx.io.DataIter):
                 records.append(roi_record)
             data_batch = {}
             for name in self.data_name + self.label_name:
-                data_batch[name] = np.stack([r[name] for r in records])
+                data_batch[name] = np.ascontiguousarray(np.stack([r[name] for r in records]))
+            for trans in self.batch_transform:
+                trans.apply(data_batch)
             data_queue.put(data_batch)
 
     def collector(self):
         while True:
             record = self.data_queue.get()
-            data = [mx.nd.array(record[name]) for name in self.data_name]
-            label = [mx.nd.array(record[name]) for name in self.label_name]
+            data = [mx.nd.from_numpy(record[name], zero_copy=True) for name in self.data_name]
+            label = [mx.nd.from_numpy(record[name], zero_copy=True) for name in self.label_name]
             provide_data = [(k, v.shape) for k, v in zip(self.data_name, data)]
             provide_label = [(k, v.shape) for k, v in zip(self.label_name, label)]
             data_batch = mx.io.DataBatch(data=data,
@@ -676,7 +743,7 @@ class Loader(mx.io.DataIter):
 
 class SequentialLoader(mx.io.DataIter):
     def __init__(self, iters):
-        super(SequentialLoader, self).__init__()
+        super().__init__()
         self.iters = iters
         self.exhausted = [False] * len(iters)
 
@@ -716,7 +783,7 @@ class AnchorLoader(mx.io.DataIter):
     def __init__(self, roidb, transform, data_name, label_name, batch_size=1,
                  shuffle=False, num_worker=12, num_collector=4, worker_queue_depth=4,
                  collector_queue_depth=4, kv=None):
-        super(AnchorLoader, self).__init__(batch_size=batch_size)
+        super().__init__(batch_size=batch_size)
 
         v_roidb, h_roidb = self.roidb_aspect_group(roidb)
 
@@ -729,18 +796,23 @@ class AnchorLoader(mx.io.DataIter):
             v_part = len(v_roidb) // num_rank
             v_remain = len(v_roidb) % num_rank
             v_roidb_part = v_roidb[rank * v_part:(rank + 1) * v_part]
+            v_valid_count = len(v_roidb_part)
             v_roidb_part += v_roidb[-v_remain:][rank:rank+1]
             h_part = len(h_roidb) // num_rank
             h_remain = len(h_roidb) % num_rank
             h_roidb_part = h_roidb[rank * h_part:(rank + 1) * h_part]
+            h_valid_count = len(h_roidb_part)
             h_roidb_part += h_roidb[-h_remain:][rank:rank+1]
         else:
             v_roidb_part = v_roidb
+            v_valid_count = len(v_roidb)
             h_roidb_part = h_roidb
+            h_valid_count = len(h_roidb)
 
         loaders = []
         if len(h_roidb_part) >= batch_size:
             h_loader = Loader(roidb=h_roidb_part,
+                              valid_count=h_valid_count,
                               transform=transform,
                               data_name=data_name,
                               label_name=label_name,
@@ -749,11 +821,11 @@ class AnchorLoader(mx.io.DataIter):
                               num_worker=num_worker,
                               num_collector=num_collector,
                               worker_queue_depth=worker_queue_depth,
-                              collector_queue_depth=collector_queue_depth,
-                              kv=kv)
+                              collector_queue_depth=collector_queue_depth)
             loaders.append(h_loader)
         if len(v_roidb_part) >= batch_size:
             v_loader = Loader(roidb=v_roidb_part,
+                              valid_count=v_valid_count,
                               transform=transform,
                               data_name=data_name,
                               label_name=label_name,
@@ -762,18 +834,17 @@ class AnchorLoader(mx.io.DataIter):
                               num_worker=num_worker,
                               num_collector=num_collector,
                               worker_queue_depth=worker_queue_depth,
-                              collector_queue_depth=collector_queue_depth,
-                              kv=kv)
+                              collector_queue_depth=collector_queue_depth)
             loaders.append(v_loader)
         assert len(loaders) > 0, "at least one loader should be constructed"
         self.__loader = SequentialLoader(loaders)
 
     @property
-    def total_record(self):
-        return sum([it.total_record for it in self.__loader.iters])
+    def total_batch(self):
+        return sum([it.total_batch for it in self.__loader.iters])
 
     def __len__(self):
-        return self.total_record
+        return self.total_batch
 
     def __getattr__(self, attr):
         # delegate unknown keys to underlying iterators

@@ -21,19 +21,36 @@ The above figure shows how to convert bottleneck residual blocks to 3-branch Tri
 
 ### Use TridentNet
 
-Please setup SimpleDet following [README](../../README.md)  and use the TridentNet configuration files in the `config` folder.
+Please setup SimpleDet following [README](../../README.md) and [INSTALL](../../doc/INSTALL.md) and use the TridentNet configuration files in the `config` folder.
 
 ### Results on MS-COCO
 
 |                             | Backbone   | Test data | mAP@[0.5:0.95] | Link |
 | --------------------------- | ---------- | --------- | :------------: | -----|
-| Faster R-CNN, 1x            | ResNet-101 | minival   |      37.6      |[model](https://simpledet-model.oss-cn-beijing.aliyuncs.com/faster_r101v2c4_c5_256roi_1x.zip)|
-| TridentNet, 1x              | ResNet-101 | minival   |      40.6      |[model](https://simpledet-model.oss-cn-beijing.aliyuncs.com/tridentnet_r101v2c4_c5_1x.zip)|
-| TridentNet, 1x, Fast Approx | ResNet-101 | minival   |      39.9      |[model](https://simpledet-model.oss-cn-beijing.aliyuncs.com/tridentnet_r101v2c4_c5_fastapprox_1x.zip)|
-| TridentNet, 2x              | ResNet-101 | test-dev  |      42.8      |[model](https://simpledet-model.oss-cn-beijing.aliyuncs.com/tridentnet_r101v2c4_c5_addminival_2x.zip)|
-| TridentNet*, 3x             | ResNet-101 | test-dev  |      48.4      |[model](https://simpledet-model.oss-cn-beijing.aliyuncs.com/tridentnet_r101v2c4_c5_multiscale_addminival_3x_fp16.zip)|
+| Faster R-CNN, 1x            | ResNet-101 | minival   |      37.6      |[model](https://1dv.aflat.top/faster_r101v2c4_c5_256roi_1x.zip)|
+| TridentNet, 1x              | ResNet-101 | minival   |      40.6      |[model](https://1dv.aflat.top/tridentnet_r101v2c4_c5_1x.zip)|
+| TridentNet, 1x, Fast Approx | ResNet-101 | minival   |      39.9      |[model](https://1dv.aflat.top/tridentnet_r101v2c4_c5_fastapprox_1x.zip)|
+| TridentNet, 2x              | ResNet-101 | test-dev  |      42.8      |[model](https://1dv.aflat.top/tridentnet_r101v2c4_c5_addminival_2x.zip)|
+| TridentNet*, 3x             | ResNet-101 | test-dev  |      48.4      |[model](https://1dv.aflat.top/tridentnet_r101v2c4_c5_multiscale_addminival_3x_fp16.zip)|
 
-Note: to test TridentNet*, please import `resnet_v2_for_paper` other than `resnet_v2` in `tridentnet/builder.py` due to a slight difference in the position of a FP16 cast operator.
+Note: 
+1. These models are not trained in SimpleDet. Re-training these models in SimpleDet gives a slightly better result.
+2. TridentNet* - TridentNet = extended training + softNMS + multi-scale training/testing + syncBN + DCNv1.
+
+### Results on MS-COCO with stronger baselines
+All config files are available in [config/resnet_v1b](../../config/resnet_v1b).
+
+|Model|Backbone|Head|Train Schedule|AP|AP50|AP75|APs|APm|APl|
+|-----|--------|----|--------------|--|----|----|---|---|---|
+|Faster|R50v1b-C4|C5-512ROI|2X|36.9|57.9|39.3|19.9|41.4|50.2|
+|Trident|R50v1b-C4|C5-128ROI|2X|39.6|60.9|42.9|22.5|44.5|53.9|
+|TridentFast|R50v1b-C4|C5-128ROI|2X|39.0|60.2|41.8|20.8|43.6|53.8|
+|Faster|R101v1b-C4|C5-512ROI|2X|40.5|61.2|43.8|22.5|44.8|55.4|
+|Trident|R101v1b-C4|C5-128ROI|2X|43.0|64.3|46.3|25.3|47.9|58.4|
+|TridentFast|R101v1b-C4|C5-128ROI|2X|42.5|63.7|46.0|23.3|46.7|59.3|
+|Faster|R152v1b-C4|C5-512ROI|2X|41.8|62.4|45.2|23.2|46.0|56.9|
+|Trident|R152v1b-C4|C5-128ROI|2X|44.4|65.4|48.3|26.4|49.4|59.6|
+|TridentFast|R152v1b-C4|C5-128ROI|2X|43.9|65.1|47.0|25.1|48.1|60.4|
 
 ### Citing TridentNet
 
@@ -41,7 +58,7 @@ Note: to test TridentNet*, please import `resnet_v2_for_paper` other than `resne
 @article{li2019scale,
   title={Scale-Aware Trident Networks for Object Detection},
   author={Li, Yanghao and Chen, Yuntao and Wang, Naiyan and Zhang, Zhaoxiang},
-  journal={arXiv preprint arXiv:1901.01892},
+  journal={ICCV 2019},
   year={2019}
 }
 ```

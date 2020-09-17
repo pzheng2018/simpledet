@@ -7,7 +7,7 @@ from operator_py.cython.bbox import bbox_overlaps_cython
 
 class ScaleAwareRange(DetectionAugmentation):
     def __init__(self, pScaleRange):
-        super(ScaleAwareRange, self).__init__()
+        super().__init__()
         self.p = pScaleRange
 
     def apply(self, input_record):
@@ -35,7 +35,7 @@ class TridentAnchorTarget2D(AnchorTarget2D):
     """
 
     def __init__(self, pAnchor):
-        super(TridentAnchorTarget2D, self).__init__(pAnchor)
+        super().__init__(pAnchor)
 
     def _filter_anchor_by_scale_range(self, cls_label, valid_anchor, gt_bbox, valid_range, invalid_anchor_threshd):
         if len(gt_bbox) == 0:
@@ -82,17 +82,6 @@ class TridentAnchorTarget2D(AnchorTarget2D):
 
         cls_labels, reg_targets, reg_weights = [], [], []
         for valid_range in valid_ranges:
-            # cls_label, reg_target, reg_weight = valid_cls_label.copy(), valid_reg_target.copy(), valid_reg_weight.copy()
-            # self._filter_anchor_by_scale_range(cls_label, reg_weight, valid_anchor, gt_bbox,
-            #                                    valid_range, p.trident.invalid_anchor_threshd)
-            #
-            # self._sample_anchor(cls_label, reg_weight, p.sample.image_anchor, p.sample.pos_fraction)
-            #
-            # cls_label, reg_target, reg_weight = \
-            #     self._scatter_valid_anchor(valid_index, cls_label, reg_target, reg_weight)
-            # cls_label, anchor_label = \
-            #     self._assign_label_to_anchor(valid_anchor, gt_bbox,
-            #                                  p.assign.neg_thr, p.assign.pos_thr, p.assign.min_pos_thr)
             cls_label = valid_cls_label.copy()
             self._filter_anchor_by_scale_range(cls_label, valid_anchor, gt_bbox,
                                                valid_range, p.trident.invalid_anchor_threshd)

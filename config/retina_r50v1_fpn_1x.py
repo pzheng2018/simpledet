@@ -14,7 +14,7 @@ def get_config(is_train):
 
 
     class KvstoreParam:
-        kvstore     = "local"
+        kvstore     = "nccl"
         batch_image = General.batch_image
         gpus        = [0, 1, 2, 3, 4, 5, 6, 7]
         fp16        = General.fp16
@@ -100,9 +100,9 @@ def get_config(is_train):
 
     class DatasetParam:
         if is_train:
-            image_set = ("coco_train2014", "coco_valminusminival2014")
+            image_set = ("coco_train2017", )
         else:
-            image_set = ("coco_minival2014", )
+            image_set = ("coco_val2017", )
 
     backbone = Backbone(BackboneParam)
     neck = Neck(NeckParam)

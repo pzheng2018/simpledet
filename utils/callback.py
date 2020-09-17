@@ -4,8 +4,9 @@ import mxnet as mx
 
 
 class Speedometer(object):
-    def __init__(self, batch_size, frequent=50):
+    def __init__(self, batch_size, total_iter, frequent=50):
         self.batch_size = batch_size
+        self.total_iter = total_iter
         self.frequent = frequent
         self.init = False
         self.tic = 0
@@ -23,12 +24,13 @@ class Speedometer(object):
                 speed = self.frequent * self.batch_size / (time.time() - self.tic)
                 if param.eval_metric is not None:
                     name, value = param.eval_metric.get()
-                    s = "Epoch[%d] Batch [%d]\tSpeed: %.2f samples/sec\tTrain-" % (param.epoch, count, speed)
+                    s = "Epoch[%d] Batch [%d]\tIter: %d/%d\tLr: %.5f\tSpeed: %.2f samples/sec\tTrain-" % \
+                        (param.epoch, count, param.iter, self.total_iter, param.lr, speed)
                     for n, v in zip(name, value):
                         s += "%s=%f,\t" % (n, v)
                     logging.info(s)
                 else:
-                    logging.info("Iter[%d] Batch [%d]\tSpeed: %.2f samples/sec",
+                    logging.info("Epoch[%d] Batch [%d]\tSpeed: %.2f samples/sec",
                                  param.epoch, count, speed)
                 self.tic = time.time()
         else:
@@ -88,4 +90,16 @@ class DetailSpeedometer(object):
 def do_checkpoint(prefix):
     def _callback(iter_no, sym, arg, aux):
         mx.model.save_checkpoint(prefix, iter_no + 1, sym, arg, aux)
+    return _callback
+
+
+def do_checkpoint_iter(prefix, checkpoint_iter):
+    def _callback(param):
+        if checkpoint_iter == param.locals["total_iter"]:
+            arg_params, aux_params = param.locals["self"].get_params()
+            save_dict = {('arg:%s' % k) : v.as_in_context(mx.cpu()) for k, v in arg_params.items()}
+            save_dict.update({('aux:%s' % k) : v.as_in_context(mx.cpu()) for k, v in aux_params.items()})
+            param_name = '%s-iter-%s.params' % (prefix, checkpoint_iter)
+            mx.nd.save(param_name, save_dict)
+            logging.info('Saved checkpoint to \"%s\"', param_name)
     return _callback

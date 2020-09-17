@@ -1,8 +1,8 @@
 from models.cascade_rcnn.builder import CascadeRcnn as Detector
 from symbol.builder import MXNetResNet101V2C4C5 as Backbone
-from models.cascade_rcnn.builder import CascadeNeck as Neck
+from symbol.builder import ReduceNeck as Neck
 from symbol.builder import RpnHead
-from models.cascade_rcnn.builder import CascadeRoiAlign as RoiExtractor
+from symbol.builder import RoiAlign as RoiExtractor
 from models.cascade_rcnn.builder import CascadeBbox2fcHead as BboxHead
 from mxnext.complicate import normalizer_factory
 
@@ -35,7 +35,9 @@ def get_config(is_train):
     class NeckParam:
         fp16 = General.fp16
         normalizer = NormalizeParam.normalizer
-        conv_channel = 1024
+
+        class reduce:
+            channel = 1024
 
 
     class RpnParam:
@@ -61,7 +63,7 @@ def get_config(is_train):
             min_bbox_side = 0
 
         class subsample_proposal:
-            proposal_wo_gt = True
+            proposal_wo_gt = False
             image_roi = 256
             fg_fraction = 0.25
             fg_thr = 0.5
@@ -83,15 +85,15 @@ def get_config(is_train):
         image_roi   = 256
         batch_image = General.batch_image
         stage       = "1st"
+        loss_weight = 1.0
 
         class regress_target:
             class_agnostic = True
             mean = (0.0, 0.0, 0.0, 0.0)
             std = (0.1, 0.1, 0.2, 0.2)
-            loss_weight = 1.0
 
         class subsample_proposal:
-            proposal_wo_gt = True
+            proposal_wo_gt = False
             image_roi = 256
             fg_fraction = 0.25
             fg_thr = 0.6
@@ -113,15 +115,15 @@ def get_config(is_train):
         image_roi   = 256
         batch_image = General.batch_image
         stage       = "2nd"
+        loss_weight = 0.5
 
         class regress_target:
             class_agnostic = True
             mean = (0.0, 0.0, 0.0, 0.0)
             std = (0.05, 0.05, 0.1, 0.1)
-            loss_weight = 0.5
 
         class subsample_proposal:
-            proposal_wo_gt = True
+            proposal_wo_gt = False
             image_roi = 256
             fg_fraction = 0.25
             fg_thr = 0.7
@@ -142,12 +144,12 @@ def get_config(is_train):
         image_roi   = 256
         batch_image = General.batch_image
         stage       = "3rd"
+        loss_weight = 0.25
 
         class regress_target:
             class_agnostic = True
             mean = (0.0, 0.0, 0.0, 0.0)
             std = (0.033, 0.033, 0.067, 0.067)
-            loss_weight = 0.25
 
         class subsample_proposal:
             proposal_wo_gt = None
@@ -174,9 +176,9 @@ def get_config(is_train):
 
     class DatasetParam:
         if is_train:
-            image_set = ("coco_train2014", "coco_valminusminival2014")
+            image_set = ("coco_train2017", )
         else:
-            image_set = ("coco_minival2014", )
+            image_set = ("coco_val2017", )
 
     backbone = Backbone(BackboneParam)
     neck = Neck(NeckParam)
@@ -196,9 +198,11 @@ def get_config(is_train):
             bbox_head_2nd,
             bbox_head_3rd
         )
+        rpn_test_sym = None
         test_sym = None
     else:
         train_sym = None
+        rpn_test_sym = detector.get_rpn_test_symbol(backbone, neck, rpn_head)
         test_sym = detector.get_test_symbol(
             backbone,
             neck,
@@ -213,6 +217,7 @@ def get_config(is_train):
     class ModelParam:
         train_symbol = train_sym
         test_symbol = test_sym
+        rpn_tes_symbol = rpn_test_sym
 
         from_scratch = False
         random = True
@@ -231,7 +236,7 @@ def get_config(is_train):
             lr = 0.01 / 8 * len(KvstoreParam.gpus) * KvstoreParam.batch_image
             momentum = 0.9
             wd = 0.0001
-            clip_gradient = 35
+            clip_gradient = None
 
         class schedule:
             begin_epoch = 0

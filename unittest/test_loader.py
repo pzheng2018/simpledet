@@ -1,7 +1,7 @@
+import pickle as pkl
 import unittest
 import mxnet as mx
 
-from six.moves import cPickle as pkl
 from core.detection_input import ReadRoiRecord, Resize2DImageBbox, \
     ConvertImageFromHwcToChw, Flip2DImageBbox, Pad2DImageBbox, \
     RenameRecord, AnchorTarget2D, AnchorLoader
@@ -23,7 +23,7 @@ class TestLoader(unittest.TestCase):
             label_name=label_name,
             batch_size=1,
             shuffle=True,
-            num_thread=1,
+            num_worker=1,
             kv=mx.kvstore.create(pKv.kvstore)
         )
         with self.assertRaises(StopIteration):
@@ -43,7 +43,7 @@ class TestLoader(unittest.TestCase):
             label_name=label_name,
             batch_size=1,
             shuffle=True,
-            num_thread=1,
+            num_worker=1,
             kv=mx.kvstore.create(pKv.kvstore)
         )
         with self.assertRaises(StopIteration):
@@ -63,7 +63,7 @@ class TestLoader(unittest.TestCase):
             label_name=label_name,
             batch_size=batch_size,
             shuffle=True,
-            num_thread=1,
+            num_worker=1,
             kv=mx.kvstore.create(pKv.kvstore)
         )
 

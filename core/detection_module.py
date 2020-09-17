@@ -23,6 +23,7 @@ more `Executor` for data parallelization.
 import time
 import logging
 import warnings
+from collections import namedtuple
 
 import mxnet
 
@@ -35,13 +36,16 @@ from mxnet.base import _as_list
 from mxnet.module.executor_group import DataParallelExecutorGroup
 from mxnet.model import _create_kvstore, _initialize_kvstore, _update_params, _update_params_on_kvstore
 from mxnet.model import load_checkpoint
-from mxnet.model import BatchEndParam
 from mxnet.initializer import Uniform, InitDesc
 from mxnet.io import DataDesc
 from mxnet.ndarray import zeros
 
 from mxnet.module.base_module import BaseModule, _check_input_names, _parse_data_desc
 from mxnet.module.module import Module
+
+
+BatchEndParam = namedtuple('BatchEndParams',
+                           ['epoch', 'nbatch', 'eval_metric', 'lr', 'iter', 'locals'])
 
 
 class DetModule(BaseModule):
@@ -77,8 +81,8 @@ class DetModule(BaseModule):
         See mxnet.KVStore.set_gradient_compression method for more details on gradient compression.
     """
     def __init__(self, symbol, data_names=None, label_names=None, logger=logging, context=ctx.cpu(),
-                 fixed_param_prefix=None):
-        super(DetModule, self).__init__(logger=logger)
+                 fixed_param=None, excluded_param=None):
+        super().__init__(logger=logger)
 
         if isinstance(context, ctx.Context):
             context = [context]
@@ -96,11 +100,17 @@ class DetModule(BaseModule):
         state_names = []
 
         fixed_param_names = list()
-        if fixed_param_prefix is not None:
+        if fixed_param is not None:
             for name in self._symbol.list_arguments():
-                for prefix in fixed_param_prefix:
-                    if prefix in name:
+                for fixed_partial_name in fixed_param:
+                    if fixed_partial_name in name:
                         fixed_param_names.append(name)
+        if excluded_param is not None:
+            for name in fixed_param_names.copy():
+                for excluded_partial_name in excluded_param:
+                    if excluded_partial_name in name:
+                        fixed_param_names.remove(name)
+        logger.info("fixed parameters: {}".format(fixed_param_names))
 
         _check_input_names(symbol, data_names, "data", True)
         _check_input_names(symbol, label_names, "label", False)
@@ -886,7 +896,7 @@ class DetModule(BaseModule):
             eval_batch_end_callback=None, initializer=Uniform(0.01),
             arg_params=None, aux_params=None, allow_missing=False,
             force_rebind=False, force_init=False, begin_epoch=0, num_epoch=None,
-            validation_metric=None, monitor=None, sparse_row_id_fn=None):
+            validation_metric=None, monitor=None, sparse_row_id_fn=None, profile=False):
 
         """Trains the module parameters.
         Checkout `Module Tutorial <http://mxnet.io/tutorials/basic/module.html>`_ to see
@@ -958,6 +968,9 @@ class DetModule(BaseModule):
         self.bind(data_shapes=train_data.provide_data, label_shapes=train_data.provide_label,
                   for_training=True, force_rebind=force_rebind)
 
+        self.logger.info("MEM usage: {} MiB".
+            format(int(self._exec_group.execs[0].debug_str().split('\n')[-3].split()[1])))
+
         if monitor is not None:
             self.install_monitor(monitor)
         self.init_params(initializer=initializer, arg_params=arg_params, aux_params=aux_params,
@@ -973,6 +986,7 @@ class DetModule(BaseModule):
         ################################################################################
         # training loop
         ################################################################################
+        total_iter = 0
         for epoch in range(begin_epoch, num_epoch):
             tic = time.time()
             eval_metric.reset()
@@ -981,6 +995,11 @@ class DetModule(BaseModule):
             end_of_batch = False
             next_data_batch = next(data_iter)
             while not end_of_batch:
+                if profile is True and epoch == begin_epoch and nbatch == 1:
+                    self.logger.info("Profiling begins")
+                    import mxnet as mx
+                    mx.profiler.set_state("run")
+
                 data_batch = next_data_batch
                 if monitor is not None:
                     monitor.tic()
@@ -1010,10 +1029,18 @@ class DetModule(BaseModule):
                 if batch_end_callback is not None:
                     batch_end_params = BatchEndParam(epoch=epoch, nbatch=nbatch,
                                                      eval_metric=eval_metric,
+                                                     lr=self._optimizer.lr_scheduler(total_iter),
+                                                     iter=total_iter,
                                                      locals=locals())
                     for callback in _as_list(batch_end_callback):
                         callback(batch_end_params)
                 nbatch += 1
+                total_iter += 1
+
+                if profile is True and epoch == begin_epoch and nbatch == 10:
+                    self.logger.info("Profiling ends")
+                    mx.profiler.set_state("stop")
+                    mx.profiler.dump()
 
             # one epoch of training is finished
             for name, val in eval_name_vals:

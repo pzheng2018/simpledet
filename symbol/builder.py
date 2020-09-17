@@ -1,57 +1,110 @@
 from __future__ import print_function
 
+import mxnet as mx
 import mxnext as X
+from utils.patch_config import patch_config_as_nothrow
+from utils.deprecated import deprecated
 
 
-class FasterRcnn(object):
+class RPN(object):
+    _rpn_output = None
+
     def __init__(self):
         pass
 
-    @staticmethod
-    def get_train_symbol(backbone, neck, rpn_head, roi_extractor, bbox_head):
+    @classmethod
+    def get_train_symbol(cls, backbone, neck, rpn_head):
+        rpn_feat = backbone.get_rpn_feature()
+        rpn_feat = neck.get_rpn_feature(rpn_feat)
+
+        rpn_loss = rpn_head.get_loss(rpn_feat, None, None)
+
+        return X.group(rpn_loss)
+
+    @classmethod
+    def get_rpn_test_symbol(cls, backbone, neck, rpn_head):
+        if cls._rpn_output is not None:
+            return cls._rpn_output
+
+        im_info = X.var("im_info")
+        im_id = X.var("im_id")
+        rec_id = X.var("rec_id")
+
+        rpn_feat = backbone.get_rpn_feature()
+        rpn_feat = neck.get_rpn_feature(rpn_feat)
+
+        (proposal, proposal_score) = rpn_head.get_all_proposal(rpn_feat, im_info)
+
+        cls._rpn_output = X.group([rec_id, im_id, im_info, proposal, proposal_score])
+        return cls._rpn_output
+
+
+class FasterRcnn(object):
+    _rpn_output = None
+
+    def __init__(self):
+        pass
+
+    @classmethod
+    def get_train_symbol(cls, backbone, neck, rpn_head, roi_extractor, bbox_head):
         gt_bbox = X.var("gt_bbox")
         im_info = X.var("im_info")
-        rpn_cls_label = X.var("rpn_cls_label")
-        rpn_reg_target = X.var("rpn_reg_target")
-        rpn_reg_weight = X.var("rpn_reg_weight")
 
         rpn_feat = backbone.get_rpn_feature()
         rcnn_feat = backbone.get_rcnn_feature()
         rpn_feat = neck.get_rpn_feature(rpn_feat)
         rcnn_feat = neck.get_rcnn_feature(rcnn_feat)
 
-        rpn_loss = rpn_head.get_loss(rpn_feat, rpn_cls_label, rpn_reg_target, rpn_reg_weight)
+        rpn_head.get_anchor()
+        rpn_loss = rpn_head.get_loss(rpn_feat, gt_bbox, im_info)
         proposal, bbox_cls, bbox_target, bbox_weight = rpn_head.get_sampled_proposal(rpn_feat, gt_bbox, im_info)
         roi_feat = roi_extractor.get_roi_feature(rcnn_feat, proposal)
         bbox_loss = bbox_head.get_loss(roi_feat, bbox_cls, bbox_target, bbox_weight)
 
         return X.group(rpn_loss + bbox_loss)
 
-    @staticmethod
-    def get_test_symbol(backbone, neck, rpn_head, roi_extractor, bbox_head):
-        im_info = X.var("im_info")
-        im_id = X.var("im_id")
-        rec_id = X.var("rec_id")
+    @classmethod
+    def get_test_symbol(cls, backbone, neck, rpn_head, roi_extractor, bbox_head):
+        rec_id, im_id, im_info, proposal, proposal_score = \
+            FasterRcnn.get_rpn_test_symbol(backbone, neck, rpn_head)
 
-        rpn_feat = backbone.get_rpn_feature()
         rcnn_feat = backbone.get_rcnn_feature()
-        rpn_feat = neck.get_rpn_feature(rpn_feat)
         rcnn_feat = neck.get_rcnn_feature(rcnn_feat)
 
-        proposal = rpn_head.get_all_proposal(rpn_feat, im_info)
         roi_feat = roi_extractor.get_roi_feature_test(rcnn_feat, proposal)
         cls_score, bbox_xyxy = bbox_head.get_prediction(roi_feat, im_info, proposal)
 
         return X.group([rec_id, im_id, im_info, cls_score, bbox_xyxy])
 
+    @classmethod
+    def get_rpn_test_symbol(cls, backbone, neck, rpn_head):
+        if cls._rpn_output is not None:
+            return cls._rpn_output
+
+        im_info = X.var("im_info")
+        im_id = X.var("im_id")
+        rec_id = X.var("rec_id")
+
+        rpn_head.get_anchor()
+        rpn_feat = backbone.get_rpn_feature()
+        rpn_feat = neck.get_rpn_feature(rpn_feat)
+
+        (proposal, proposal_score) = rpn_head.get_all_proposal(rpn_feat, im_info)
+
+        cls._rpn_output = X.group([rec_id, im_id, im_info, proposal, proposal_score])
+        return cls._rpn_output
+
 
 class RpnHead(object):
     def __init__(self, pRpn):
-        self.p = pRpn  # type: RPNParam
+        self.p = patch_config_as_nothrow(pRpn)
 
         self._cls_logit             = None
         self._bbox_delta            = None
         self._proposal              = None
+
+    def get_anchor(self):
+        pass
 
     def get_output(self, conv_feat):
         if self._cls_logit is not None and self._bbox_delta is not None:
@@ -61,14 +114,27 @@ class RpnHead(object):
         num_base_anchor = len(p.anchor_generate.ratio) * len(p.anchor_generate.scale)
         conv_channel = p.head.conv_channel
 
-        conv = X.convrelu(
-            conv_feat,
-            kernel=3,
-            filter=conv_channel,
-            name="rpn_conv_3x3",
-            no_bias=False,
-            init=X.gauss(0.01)
-        )
+        if p.normalizer.__name__ == "fix_bn":
+            conv = X.convrelu(
+                conv_feat,
+                kernel=3,
+                filter=conv_channel,
+                name="rpn_conv_3x3",
+                no_bias=False,
+                init=X.gauss(0.01)
+            )
+        elif p.normalizer.__name__ in ["sync_bn", "gn"]:
+            conv = X.convnormrelu(
+                p.normalizer,
+                conv_feat,
+                kernel=3,
+                filter=conv_channel,
+                name="rpn_conv_3x3",
+                no_bias=False,
+                init=X.gauss(0.01)
+            )
+        else:
+            raise NotImplementedError("Unsupported normalizer: {}".format(p.normalizer.__name__))
 
         if p.fp16:
             conv = X.to_fp32(conv, name="rpn_conv_3x3_fp32")
@@ -94,10 +160,7 @@ class RpnHead(object):
 
         return self._cls_logit, self._bbox_delta
 
-    def get_anchor_target(self, conv_feat):
-        raise NotImplementedError
-
-    def get_loss(self, conv_feat, cls_label, bbox_target, bbox_weight):
+    def get_loss(self, conv_feat, gt_bboxes, im_infos):
         p = self.p
         batch_image = p.batch_image
         image_anchor = p.anchor_generate.image_anchor
@@ -105,6 +168,10 @@ class RpnHead(object):
         cls_logit, bbox_delta = self.get_output(conv_feat)
 
         scale_loss_shift = 128.0 if p.fp16 else 1.0
+
+        cls_label = X.var("rpn_cls_label")
+        bbox_target = X.var("rpn_reg_target")
+        bbox_weight = X.var("rpn_reg_weight")
 
         # classification loss
         cls_logit_reshape = X.reshape(
@@ -183,8 +250,32 @@ class RpnHead(object):
             rpn_post_nms_top_n=post_nms_top_n,
             threshold=nms_thr,
             rpn_min_size=min_bbox_side,
-            iou_loss=False
+            iou_loss=False,
+            output_score=True
         )
+
+        if p.use_symbolic_proposal is not None:
+            batch_size = p.batch_image
+            max_side = p.anchor_generate.max_side
+            assert max_side is not None, "symbolic proposal requires max_side of image"
+
+            from mxnext.tvm.proposal import proposal as Proposal
+            proposal = Proposal(
+                cls_prob=cls_logit_reshape,
+                bbox_pred=bbox_delta,
+                im_info=im_info,
+                name='proposal',
+                feature_stride=rpn_stride,
+                scales=tuple(anchor_scale),
+                ratios=tuple(anchor_ratio),
+                rpn_pre_nms_top_n=pre_nms_top_n,
+                rpn_post_nms_top_n=post_nms_top_n,
+                threshold=nms_thr,
+                batch_size=batch_size,
+                max_side=max_side,
+                output_score=True,
+                variant="simpledet"
+            )
 
         self._proposal = proposal
 
@@ -208,7 +299,7 @@ class RpnHead(object):
         bbox_target_mean = p.bbox_target.mean
         bbox_target_std = p.bbox_target.std
 
-        proposal = self.get_all_proposal(conv_feat, im_info)
+        (proposal, proposal_score) = self.get_all_proposal(conv_feat, im_info)
 
         (bbox, label, bbox_target, bbox_weight) = X.proposal_target(
             rois=proposal,
@@ -237,12 +328,12 @@ class RpnHead(object):
 
 class BboxHead(object):
     def __init__(self, pBbox):
-        self.p = pBbox  # type: BboxParam
+        self.p = patch_config_as_nothrow(pBbox)
 
         self._head_feat = None
 
     def _get_bbox_head_logit(self, conv_feat):
-        raise NotImplemented
+        raise NotImplementedError
 
     def get_output(self, conv_feat):
         p = self.p
@@ -251,17 +342,21 @@ class BboxHead(object):
 
         head_feat = self._get_bbox_head_logit(conv_feat)
 
+        if not isinstance(head_feat, dict):
+            head_feat = dict(classification=head_feat, regression=head_feat)
+
         if p.fp16:
-            head_feat = X.to_fp32(head_feat, name="bbox_head_to_fp32")
+            head_feat["classification"] = X.to_fp32(head_feat["classification"], name="bbox_cls_head_to_fp32")
+            head_feat["regression"] = X.to_fp32(head_feat["regression"], name="bbox_reg_head_to_fp32")
 
         cls_logit = X.fc(
-            head_feat,
+            head_feat["classification"],
             filter=num_class,
             name='bbox_cls_logit',
             init=X.gauss(0.01)
         )
         bbox_delta = X.fc(
-            head_feat,
+            head_feat["regression"],
             filter=4 * num_reg_class,
             name='bbox_reg_delta',
             init=X.gauss(0.001)
@@ -311,6 +406,7 @@ class BboxHead(object):
         p = self.p
         batch_roi = p.image_roi * p.batch_image
         batch_image = p.batch_image
+        smooth_l1_scalar = p.regress_target.smooth_l1_scalar or 1.0
 
         cls_logit, bbox_delta = self.get_output(conv_feat)
 
@@ -328,7 +424,7 @@ class BboxHead(object):
         # bounding box regression
         reg_loss = X.smooth_l1(
             bbox_delta - bbox_target,
-            scalar=1.0,
+            scalar=smooth_l1_scalar,
             name='bbox_reg_l1'
         )
         reg_loss = bbox_weight * reg_loss
@@ -352,25 +448,112 @@ class BboxHead(object):
 
 class Bbox2fcHead(BboxHead):
     def __init__(self, pBbox):
-        super(Bbox2fcHead, self).__init__(pBbox)
+        super().__init__(pBbox)
+
+    def add_norm(self, sym):
+        p = self.p
+        if p.normalizer.__name__ == "fix_bn":
+            pass
+        elif p.normalizer.__name__ in ["sync_bn", "local_bn", "gn", "dummy"]:
+            sym = p.normalizer(sym)
+        else:
+            raise NotImplementedError("Unsupported normalizer: {}".format(p.normalizer.__name__))
+        return sym
 
     def _get_bbox_head_logit(self, conv_feat):
         if self._head_feat is not None:
             return self._head_feat
 
-        flatten = X.flatten(conv_feat, name="bbox_feat_flatten")
-        reshape = X.reshape(flatten, (0, 0, 1, 1), name="bbox_feat_reshape")
-        fc1 = X.convrelu(reshape, filter=1024, name="bbox_fc1")
-        fc2 = X.convrelu(fc1, filter=1024, name="bbox_fc2")
+        xavier_init = mx.init.Xavier(factor_type="in", rnd_type="uniform", magnitude=3)
+
+        flatten = X.reshape(conv_feat, shape=(0, -1, 1, 1), name="bbox_feat_reshape")
+        fc1 = X.conv(flatten, filter=1024, name="bbox_fc1", init=xavier_init)
+        fc1 = self.add_norm(fc1)
+        fc1 = X.relu(fc1)
+        fc2 = X.conv(fc1, filter=1024, name="bbox_fc2", init=xavier_init)
+        fc2 = self.add_norm(fc2)
+        fc2 = X.relu(fc2)
 
         self._head_feat = fc2
 
         return self._head_feat
 
 
+class Bbox1conv2fcHead(BboxHead):
+    def __init__(self, pBbox):
+        super().__init__(pBbox)
+
+    def _get_bbox_head_logit(self, conv_feat):
+        if self._head_feat is not None:
+            return self._head_feat
+
+        p = self.p
+
+        if p.normalizer.__name__ == "fix_bn":
+            conv_feat = X.convrelu(conv_feat, filter=256, kernel=3, name="bbox_conv1")
+        elif p.normalizer.__name__ in ["sync_bn", "gn"]:
+            conv_feat = X.convnormrelu(p.normalizer, conv_feat, filter=256, kernel=3, name="bbox_conv1")
+        else:
+            raise NotImplementedError("Unsupported normalizer: {}".format(p.normalizer.__name__))
+
+        flatten = X.flatten(conv_feat, name="bbox_feat_flatten")
+        reshape = X.reshape(flatten, (0, 0, 1, 1), name="bbox_feat_reshape")
+
+        if p.normalizer.__name__ == "fix_bn":
+            fc1 = X.convrelu(reshape, filter=1024, name="bbox_fc1")
+            fc2 = X.convrelu(fc1, filter=1024, name="bbox_fc2")
+        elif p.normalizer.__name__ in ["sync_bn", "gn"]:
+            fc1 = X.convnormrelu(p.normalizer, reshape, filter=1024, name="bbox_fc1")
+            fc2 = X.convnormrelu(p.normalizer, fc1, filter=1024, name="bbox_fc2")
+        else:
+            raise NotImplementedError("Unsupported normalizer: {}".format(p.normalizer.__name__))
+
+        self._head_feat = fc2
+
+        return self._head_feat
+
+
+class Bbox4conv1fcHead(BboxHead):
+    def __init__(self, pBbox):
+        super().__init__(pBbox)
+
+    def _get_bbox_head_logit(self, conv_feat):
+        if self._head_feat is not None:
+            return self._head_feat
+
+        p = self.p
+
+        if p.normalizer.__name__ == "fix_bn":
+            conv_feat = X.convrelu(conv_feat, filter=256, kernel=3, name="bbox_conv1")
+            conv_feat = X.convrelu(conv_feat, filter=256, kernel=3, name="bbox_conv2")
+            conv_feat = X.convrelu(conv_feat, filter=256, kernel=3, name="bbox_conv3")
+            conv_feat = X.convrelu(conv_feat, filter=256, kernel=3, name="bbox_conv4")
+        elif p.normalizer.__name__ in ["sync_bn", "gn"]:
+            conv_feat = X.convnormrelu(p.normalizer, conv_feat, filter=256, kernel=3, name="bbox_conv1")
+            conv_feat = X.convnormrelu(p.normalizer, conv_feat, filter=256, kernel=3, name="bbox_conv2")
+            conv_feat = X.convnormrelu(p.normalizer, conv_feat, filter=256, kernel=3, name="bbox_conv3")
+            conv_feat = X.convnormrelu(p.normalizer, conv_feat, filter=256, kernel=3, name="bbox_conv4")
+        else:
+            raise NotImplementedError("Unsupported normalizer: {}".format(p.normalizer.__name__))
+
+        flatten = X.flatten(conv_feat, name="bbox_feat_flatten")
+        reshape = X.reshape(flatten, (0, 0, 1, 1), name="bbox_feat_reshape")
+
+        if p.normalizer.__name__ == "fix_bn":
+            fc1 = X.convrelu(reshape, filter=1024, name="bbox_fc1")
+        elif p.normalizer.__name__ in ["sync_bn", "gn"]:
+            fc1 = X.convnormrelu(p.normalizer, reshape, filter=1024, name="bbox_fc1")
+        else:
+            raise NotImplementedError("Unsupported normalizer: {}".format(p.normalizer.__name__))
+
+        self._head_feat = fc1
+
+        return self._head_feat
+
+
 class BboxC5Head(BboxHead):
     def __init__(self, pBbox):
-        super(BboxC5Head, self).__init__(pBbox)
+        super().__init__(pBbox)
 
     def _get_bbox_head_logit(self, conv_feat):
         if self._head_feat is not None:
@@ -401,7 +584,7 @@ class BboxC5Head(BboxHead):
 
 class BboxResNeXtC5Head(BboxHead):
     def __init__(self, pBbox):
-        super(BboxResNeXtC5Head, self).__init__(pBbox)
+        super().__init__(pBbox)
 
     def _get_bbox_head_logit(self, conv_feat):
         if self._head_feat is not None:
@@ -430,7 +613,7 @@ class BboxResNeXtC5Head(BboxHead):
 
 class BboxC5V1Head(BboxHead):
     def __init__(self, pBbox):
-        super(BboxC5V1Head, self).__init__(pBbox)
+        super().__init__(pBbox)
 
     def _get_bbox_head_logit(self, conv_feat):
         if self._head_feat is not None:
@@ -459,7 +642,7 @@ class BboxC5V1Head(BboxHead):
 
 class Backbone(object):
     def __init__(self, pBackbone):
-        self.pBackbone = pBackbone
+        self.p = patch_config_as_nothrow(pBackbone)
 
     def get_rpn_feature(self):
         raise NotImplementedError
@@ -470,7 +653,7 @@ class Backbone(object):
 
 class MXNetResNet50V2(Backbone):
     def __init__(self, pBackbone):
-        super(MXNetResNet50V2, self).__init__(pBackbone)
+        super().__init__(pBackbone)
         from mxnext.backbone.resnet_v2 import Builder
         b = Builder()
         self.symbol = b.get_backbone("mxnet", 50, "c4", pBackbone.normalizer, pBackbone.fp16)
@@ -484,7 +667,7 @@ class MXNetResNet50V2(Backbone):
 
 class MXNetResNeXt50(Backbone):
     def __init__(self, pBackbone):
-        super(MXNetResNeXt50, self).__init__(pBackbone)
+        super().__init__(pBackbone)
         from mxnext.backbone.resnext import Builder
         b = Builder()
         self.symbol = b.get_backbone("mxnet", 50, "c4", pBackbone.normalizer, pBackbone.num_group, pBackbone.fp16)
@@ -496,9 +679,37 @@ class MXNetResNeXt50(Backbone):
         return self.symbol
 
 
+class MXNetResNeXt50C4C5(Backbone):
+    def __init__(self, pBackbone):
+        super(MXNetResNeXt50C4C5, self).__init__(pBackbone)
+        from mxnext.backbone.resnext import Builder
+        b = Builder()
+        self.c4, self.c5 = b.get_backbone("mxnet", 50, "c4c5", pBackbone.normalizer, pBackbone.num_group, pBackbone.fp16)
+
+    def get_rpn_feature(self):
+        return self.c4
+
+    def get_rcnn_feature(self):
+        return self.c5
+
+
+class MXNetResNeXt101C4C5(Backbone):
+    def __init__(self, pBackbone):
+        super().__init__(pBackbone)
+        from mxnext.backbone.resnext import Builder
+        b = Builder()
+        self.c4, self.c5 = b.get_backbone("mxnet", 101, "c4c5", pBackbone.normalizer, pBackbone.num_group, pBackbone.fp16)
+
+    def get_rpn_feature(self):
+        return self.c4
+
+    def get_rcnn_feature(self):
+        return self.c5
+
+
 class MXNetResNet101V2(Backbone):
     def __init__(self, pBackbone):
-        super(MXNetResNet101V2, self).__init__(pBackbone)
+        super().__init__(pBackbone)
         from mxnext.backbone.resnet_v2 import Builder
         b = Builder()
         self.symbol = b.get_backbone("mxnet", 101, "c4", pBackbone.normalizer, pBackbone.fp16)
@@ -512,7 +723,7 @@ class MXNetResNet101V2(Backbone):
 
 class ResNet50V1(Backbone):
     def __init__(self, pBackbone):
-        super(ResNet50V1, self).__init__(pBackbone)
+        super().__init__(pBackbone)
         from mxnext.backbone.resnet_v1 import Builder
         b = Builder()
         self.symbol = b.get_backbone("msra", 50, "c4", pBackbone.normalizer, pBackbone.fp16)
@@ -526,7 +737,7 @@ class ResNet50V1(Backbone):
 
 class ResNet101V1(Backbone):
     def __init__(self, pBackbone):
-        super(ResNet101V1, self).__init__(pBackbone)
+        super().__init__(pBackbone)
         from mxnext.backbone.resnet_v1 import Builder
         b = Builder()
         self.symbol = b.get_backbone("msra", 101, "c4", pBackbone.normalizer, pBackbone.fp16)
@@ -538,9 +749,51 @@ class ResNet101V1(Backbone):
         return self.symbol
 
 
+class ResNetV1bC4(Backbone):
+    def __init__(self, pBackbone):
+        super().__init__(pBackbone)
+        from mxnext.backbone.resnet_v1b import Builder
+        b = Builder()
+        self.symbol = b.get_backbone("msra", self.p.depth, "c4", pBackbone.normalizer, pBackbone.fp16)
+
+    def get_rpn_feature(self):
+        return self.symbol
+
+    def get_rcnn_feature(self):
+        return self.symbol
+
+
+class ResNetV1bFPN(Backbone):
+    def __init__(self, pBackbone):
+        super().__init__(pBackbone)
+        from mxnext.backbone.resnet_v1b import Builder
+        b = Builder()
+        self.symbol = b.get_backbone("msra", self.p.depth, "fpn", pBackbone.normalizer, pBackbone.fp16)
+
+    def get_rpn_feature(self):
+        return self.symbol
+
+    def get_rcnn_feature(self):
+        return self.symbol
+
+
+class ResNetV1dC4(Backbone):
+    def __init__(self, pBackbone):
+        super().__init__(pBackbone)
+        from mxnext.backbone.resnet_v1d import Builder
+        b = Builder()
+        self.symbol = b.get_backbone(self.p.depth, "c4", pBackbone.normalizer, pBackbone.fp16)
+
+    def get_rpn_feature(self):
+        return self.symbol
+
+    def get_rcnn_feature(self):
+        return self.symbol
+
+
 class MXNetResNet50V2C4C5(Backbone):
     def __init__(self, pBackbone):
-        super(MXNetResNet50V2C4C5, self).__init__(pBackbone)
+        super().__init__(pBackbone)
         from mxnext.backbone.resnet_v2 import Builder
         b = Builder()
         self.c4, self.c5 = b.get_backbone("mxnet", 50, "c4c5", pBackbone.normalizer, pBackbone.fp16)
@@ -554,7 +807,7 @@ class MXNetResNet50V2C4C5(Backbone):
 
 class MXNetResNet101V2C4C5(Backbone):
     def __init__(self, pBackbone):
-        super(MXNetResNet101V2C4C5, self).__init__(pBackbone)
+        super().__init__(pBackbone)
         from mxnext.backbone.resnet_v2 import Builder
         b = Builder()
         self.c4, self.c5 = b.get_backbone("mxnet", 101, "c4c5", pBackbone.normalizer, pBackbone.fp16)
@@ -568,7 +821,7 @@ class MXNetResNet101V2C4C5(Backbone):
 
 class Neck(object):
     def __init__(self, pNeck):
-        self.pNeck = pNeck
+        self.p = patch_config_as_nothrow(pNeck)
 
     def get_rpn_feature(self, rpn_feat):
         return rpn_feat
@@ -577,9 +830,40 @@ class Neck(object):
         return rcnn_feat
 
 
+class ReduceNeck(Neck):
+    def __init__(self, pNeck):
+        super().__init__(pNeck)
+
+    def get_rpn_feature(self, rpn_feat):
+        return rpn_feat
+
+    def get_rcnn_feature(self, rcnn_feat):
+        p = self.p
+
+        if p.normalizer.__name__ == "fix_bn":
+            rcnn_feat = X.convrelu(
+                rcnn_feat,
+                filter=p.reduce.channel,
+                kernel=3,
+                name="backbone_reduce"
+            )
+        elif p.normalizer.__name__ in ["sync_bn", "gn"]:
+            rcnn_feat = X.convnormrelu(
+                p.normalizer,
+                rcnn_feat,
+                filter=p.reduce.channel,
+                kernel=3,
+                name="backbone_reduce"
+            )
+        else:
+            raise NotImplementedError("Unsupported normalizer: {}".format(p.normalizer.__name__))
+
+        return rcnn_feat
+
+
 class RoiExtractor(object):
     def __init__(self, pRoi):
-        self.p = pRoi  # type: RoiParam
+        self.p = patch_config_as_nothrow(pRoi)
 
     def get_roi_feature(self, rcnn_feat, proposal):
         raise NotImplementedError
@@ -590,7 +874,7 @@ class RoiExtractor(object):
 
 class RoiAlign(RoiExtractor):
     def __init__(self, pRoi):
-        super(RoiAlign, self).__init__(pRoi)
+        super().__init__(pRoi)
 
     def get_roi_feature(self, rcnn_feat, proposal):
         p = self.p
@@ -609,9 +893,46 @@ class RoiAlign(RoiExtractor):
         if p.fp16:
             roi_feat = X.to_fp16(roi_feat, "roi_feat_to_fp16")
 
-        roi_feat = X.reshape(roi_feat, (-3, -2))
+        roi_feat = X.reshape(roi_feat, (-3, -2), name = "roi_align_reshape")
 
         return roi_feat
 
     def get_roi_feature_test(self, rcnn_feat, proposal):
         return self.get_roi_feature(rcnn_feat, proposal)
+
+
+def add_anchor_to_arg(sym, args, auxs, max_side, strides, scales, aspects):
+    import numpy as np
+
+    if not isinstance(strides, tuple) and not isinstance(strides, list):
+        strides = (strides, )
+
+    for stride in strides:
+        base_anchor = np.array([0, 0, stride - 1, stride - 1])
+
+        w = base_anchor[2] - base_anchor[0] + 1
+        h = base_anchor[3] - base_anchor[1] + 1
+        x_ctr = base_anchor[0] + 0.5 * (w - 1)
+        y_ctr = base_anchor[1] + 0.5 * (h - 1)
+
+        w_ratios = np.round(np.sqrt(w * h / aspects))
+        h_ratios = np.round(w_ratios * aspects)
+        ws = (np.outer(w_ratios, scales)).reshape(-1)
+        hs = (np.outer(h_ratios, scales)).reshape(-1)
+
+        base_anchor = np.stack(
+            [x_ctr - 0.5 * (ws - 1),
+             y_ctr - 0.5 * (hs - 1),
+             x_ctr + 0.5 * (ws - 1),
+             y_ctr + 0.5 * (hs - 1)],
+            axis=1)
+
+        shift_x = np.arange(0, max_side // stride, dtype=np.float32) * stride
+        shift_y = np.arange(0, max_side // stride, dtype=np.float32) * stride
+        grid_x, grid_y = np.meshgrid(shift_x, shift_y)
+        grid_x, grid_y = grid_x.reshape(-1), grid_y.reshape(-1)
+        grid = np.stack([grid_x, grid_y, grid_x, grid_y], axis=1)
+        all_anchor = grid[:, None, :] + base_anchor[None, :, :]
+        all_anchor = all_anchor.reshape(1, 1, max_side // stride, max_side // stride, -1)
+
+        args["anchor_stride%s" % stride] = mx.nd.array(all_anchor)

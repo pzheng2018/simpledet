@@ -1,24 +1,33 @@
 import argparse
-import logging
-import pprint
-import mxnet as mx
-import numpy as np
-import os
 import importlib
-
-from six.moves import reduce
-from six.moves import cPickle as pkl
+import logging
+import os
+import pprint
+import pickle as pkl
+from functools import reduce
 
 from core.detection_module import DetModule
 from utils import callback
 from utils.memonger_v2 import search_plan_to_layer
-from utils.lr_scheduler import WarmupMultiFactorScheduler
+from utils.lr_scheduler import LRScheduler, WarmupMultiFactorScheduler, LRSequential, AdvancedLRScheduler
 from utils.load_model import load_checkpoint
+from utils.patch_config import patch_config_as_nothrow
 
+import mxnet as mx
+import numpy as np
 
 def train_net(config):
     pGen, pKv, pRpn, pRoi, pBbox, pDataset, pModel, pOpt, pTest, \
     transform, data_name, label_name, metric_list = config.get_config(is_train=True)
+    pGen = patch_config_as_nothrow(pGen)
+    pKv = patch_config_as_nothrow(pKv)
+    pRpn = patch_config_as_nothrow(pRpn)
+    pRoi = patch_config_as_nothrow(pRoi)
+    pBbox = patch_config_as_nothrow(pBbox)
+    pDataset = patch_config_as_nothrow(pDataset)
+    pModel = patch_config_as_nothrow(pModel)
+    pOpt = patch_config_as_nothrow(pOpt)
+    pTest = patch_config_as_nothrow(pTest)
 
     ctx = [mx.gpu(int(i)) for i in pKv.gpus]
     pretrain_prefix = pModel.pretrain.prefix
@@ -35,9 +44,7 @@ def train_net(config):
     rank = kv.rank
 
     # for distributed training using shared file system
-    if rank == 0:
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
+    os.makedirs(save_path, exist_ok=True)
 
     from utils.logger import config_logger
     config_logger(os.path.join(save_path, "log.txt"))
@@ -78,7 +85,11 @@ def train_net(config):
         label_name=label_name,
         batch_size=input_batch_size,
         shuffle=True,
-        kv=kv
+        kv=kv,
+        num_worker=pGen.loader_worker or 12,
+        num_collector=pGen.loader_collector or 1,
+        worker_queue_depth=2,
+        collector_queue_depth=2
     )
 
     # infer shape
@@ -118,12 +129,31 @@ def train_net(config):
     elif pModel.from_scratch:
         arg_params, aux_params = dict(), dict()
     else:
+        if not os.path.exists("%s-%04d.params" % (pretrain_prefix, pretrain_epoch)):
+            from utils.download_pretrain import download
+            download(pretrain_prefix, pretrain_epoch)
         arg_params, aux_params = load_checkpoint(pretrain_prefix, pretrain_epoch)
 
-    try:
+    if pModel.process_weight is not None:
         pModel.process_weight(sym, arg_params, aux_params)
-    except AttributeError:
-        pass
+
+    '''
+    there are some conflicts between `mergebn` and `attach_quantized_node` in graph_optimize.py
+    when mergebn ahead of attach_quantized_node
+    such as `Symbol.ComposeKeyword`
+    '''
+    if pModel.QuantizeTrainingParam is not None and pModel.QuantizeTrainingParam.quantize_flag:
+        pQuant = pModel.QuantizeTrainingParam
+        assert pGen.fp16 == False, "current quantize training only support fp32 mode."
+        from utils.graph_optimize import attach_quantize_node
+        _, out_shape, _ = sym.get_internals().infer_shape(**worker_data_shape)
+        out_shape_dictoinary = dict(zip(sym.get_internals().list_outputs(), out_shape))
+        sym = attach_quantize_node(sym, out_shape_dictoinary, pQuant.WeightQuantizeParam,
+                                   pQuant.ActQuantizeParam, pQuant.quantized_op)
+    # merge batch normalization to save memory in fix bn training
+    from utils.graph_optimize import merge_bn
+    sym, arg_params, aux_params = merge_bn(sym, arg_params, aux_params)
+
 
     if pModel.random:
         import time
@@ -134,51 +164,96 @@ def train_net(config):
     init.set_verbosity(verbose=True)
 
     # create solver
-    fixed_param_prefix = pModel.pretrain.fixed_param
+    fixed_param = pModel.pretrain.fixed_param
+    excluded_param = pModel.pretrain.excluded_param
     data_names = [k[0] for k in train_data.provide_data]
     label_names = [k[0] for k in train_data.provide_label]
 
-    mod = DetModule(sym, data_names=data_names, label_names=label_names,
-                    logger=logger, context=ctx, fixed_param_prefix=fixed_param_prefix)
+    if pModel.teacher_param:
+        from models.KD.utils import create_teacher_module
+        from models.KD.detection_module import KDDetModule
+        t_mod, t_label_name, t_label_shape = create_teacher_module(
+            pModel.teacher_param, worker_data_shape, input_batch_size, ctx, rank, logger)
+        mod = KDDetModule(sym, teacher_module=t_mod, teacher_label_names=t_label_name,
+                          teacher_label_shapes=t_label_shape,
+                          data_names=data_names, label_names=label_names,
+                          logger=logger, context=ctx, fixed_param=fixed_param,
+                          excluded_param=excluded_param)
+    else:
+        mod = DetModule(sym, data_names=data_names, label_names=label_names,
+                        logger=logger, context=ctx, fixed_param=fixed_param, excluded_param=excluded_param)
 
     eval_metrics = mx.metric.CompositeEvalMetric(metric_list)
 
     # callback
-    batch_end_callback = callback.Speedometer(train_data.batch_size, frequent=pGen.log_frequency)
+    batch_end_callback = [callback.Speedometer(train_data.batch_size, len(train_data) * (end_epoch - begin_epoch), frequent=pGen.log_frequency)]
+    batch_end_callback += pModel.batch_end_callbacks or []
     epoch_end_callback = callback.do_checkpoint(model_prefix)
     sym.save(model_prefix + ".json")
 
     # decide learning rate
+    lr_mode = pOpt.optimizer.lr_mode or 'step'
     base_lr = pOpt.optimizer.lr * kv.num_workers
-    lr_factor = 0.1
+    lr_factor = pOpt.schedule.lr_factor or 0.1
 
-    iter_per_epoch = len(train_data) // input_batch_size
+    iter_per_epoch = len(train_data)
+    total_iter = iter_per_epoch * (end_epoch - begin_epoch)
+    lr_iter = [total_iter + it if it < 0 else it for it in lr_iter]
     lr_iter = [it // kv.num_workers for it in lr_iter]
     lr_iter = [it - iter_per_epoch * begin_epoch for it in lr_iter]
     lr_iter_discount = [it for it in lr_iter if it > 0]
     current_lr = base_lr * (lr_factor ** (len(lr_iter) - len(lr_iter_discount)))
     if rank == 0:
-        logging.info('total iter {}'.format(iter_per_epoch * (end_epoch - begin_epoch)))
+        logging.info('total iter {}'.format(total_iter))
         logging.info('lr {}, lr_iters {}'.format(current_lr, lr_iter_discount))
-    if pOpt.warmup is not None and pOpt.schedule.begin_epoch == 0:
+        logging.info('lr mode: {}'.format(lr_mode))
+
+    if pOpt.warmup and pOpt.schedule.begin_epoch == 0:
+        if pOpt.warmup.in_pct:
+            pOpt.warmup.iter //= kv.num_workers
         if rank == 0:
             logging.info(
                 'warmup lr {}, warmup step {}'.format(
                     pOpt.warmup.lr,
                     pOpt.warmup.iter)
                 )
-
-        lr_scheduler = WarmupMultiFactorScheduler(
-            step=lr_iter_discount,
-            factor=lr_factor,
-            warmup=True,
-            warmup_type=pOpt.warmup.type,
-            warmup_lr=pOpt.warmup.lr,
-            warmup_step=pOpt.warmup.iter
-        )
+        if lr_mode == 'step':
+            lr_scheduler = WarmupMultiFactorScheduler(
+                step=lr_iter_discount,
+                factor=lr_factor,
+                warmup=True,
+                warmup_type=pOpt.warmup.type,
+                warmup_lr=pOpt.warmup.lr,
+                warmup_step=pOpt.warmup.iter
+            )
+        elif lr_mode == 'cosine':
+            warmup_lr_scheduler = AdvancedLRScheduler(
+                mode='linear',
+                base_lr=pOpt.warmup.lr,
+                target_lr=base_lr,
+                niters=pOpt.warmup.iter
+            )
+            cosine_lr_scheduler = AdvancedLRScheduler(
+                mode='cosine',
+                base_lr=base_lr,
+                target_lr=0,
+                offset=pOpt.warmup.iter,
+                niters=(iter_per_epoch * (end_epoch - begin_epoch)) - pOpt.warmup.iter
+            )
+            lr_scheduler = LRSequential([warmup_lr_scheduler, cosine_lr_scheduler])
+        else:
+            raise NotImplementedError
     else:
-        if len(lr_iter_discount) > 0:
-            lr_scheduler = mx.lr_scheduler.MultiFactorScheduler(lr_iter_discount, lr_factor)
+        if lr_mode == 'step':
+            lr_scheduler = WarmupMultiFactorScheduler(step=lr_iter_discount, factor=lr_factor)
+        elif lr_mode == 'cosine':
+            lr_scheduler = AdvancedLRScheduler(
+                mode='cosine',
+                base_lr=base_lr,
+                target_lr=0,
+                offset=pOpt.warmup.iter,
+                niters=iter_per_epoch * (end_epoch - begin_epoch)
+            )
         else:
             lr_scheduler = None
 
@@ -188,13 +263,17 @@ def train_net(config):
         wd=pOpt.optimizer.wd,
         learning_rate=current_lr,
         lr_scheduler=lr_scheduler,
-        rescale_grad=1.0 / (len(pKv.gpus) * kv.num_workers),
+        rescale_grad=1.0 / (len(ctx) * kv.num_workers),
         clip_gradient=pOpt.optimizer.clip_gradient
     )
 
     if pKv.fp16:
         optimizer_params['multi_precision'] = True
         optimizer_params['rescale_grad'] /= 128.0
+
+    profile = pGen.profile or False
+    if profile:
+        mx.profiler.set_config(profile_all=True, filename=os.path.join(save_path, "profile.json"))
 
     # train
     mod.fit(
@@ -210,10 +289,13 @@ def train_net(config):
         arg_params=arg_params,
         aux_params=aux_params,
         begin_epoch=begin_epoch,
-        num_epoch=end_epoch
+        num_epoch=end_epoch,
+        profile=profile
     )
 
     logging.info("Training has done")
+    time.sleep(10)
+    logging.info("Exiting")
 
 
 def parse_args():

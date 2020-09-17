@@ -3,10 +3,12 @@ from __future__ import print_function
 import mxnext as X
 import mxnet as mx
 
-from models.FPN.builder import FPNRpnHead, FPNRoiExtractor
-from models.FPN import assign_layer_fpn, get_topk_proposal
+from symbol.builder import FasterRcnn, RpnHead
+from models.FPN.builder import FPNRpnHead
 
 from models.maskrcnn import bbox_post_processing
+from utils.patch_config import patch_config_as_nothrow
+from utils.deprecated import deprecated
 
 
 class MaskFasterRcnn(object):
@@ -18,37 +20,31 @@ class MaskFasterRcnn(object):
         gt_bbox = X.var("gt_bbox")
         gt_poly = X.var("gt_poly")
         im_info = X.var("im_info")
-        rpn_cls_label = X.var("rpn_cls_label")
-        rpn_reg_target = X.var("rpn_reg_target")
-        rpn_reg_weight = X.var("rpn_reg_weight")
 
         rpn_feat = backbone.get_rpn_feature()
         rcnn_feat = backbone.get_rcnn_feature()
         rpn_feat = neck.get_rpn_feature(rpn_feat)
         rcnn_feat = neck.get_rcnn_feature(rcnn_feat)
 
-        rpn_loss = rpn_head.get_loss(rpn_feat, rpn_cls_label, rpn_reg_target, rpn_reg_weight)
-        proposal, bbox_cls, bbox_target, bbox_weight, mask_proposal, mask_target = \
+        rpn_head.get_anchor()
+        rpn_loss = rpn_head.get_loss(rpn_feat, gt_bbox, im_info)
+        proposal, bbox_cls, bbox_target, bbox_weight, mask_proposal, mask_target, mask_ind = \
             rpn_head.get_sampled_proposal(rpn_feat, gt_bbox, gt_poly, im_info)
         roi_feat = roi_extractor.get_roi_feature(rcnn_feat, proposal)
         mask_roi_feat = mask_roi_extractor.get_roi_feature(rcnn_feat, mask_proposal)
 
         bbox_loss = bbox_head.get_loss(roi_feat, bbox_cls, bbox_target, bbox_weight)
-        mask_loss = mask_head.get_loss(mask_roi_feat, mask_target)
+        mask_loss = mask_head.get_loss(mask_roi_feat, mask_target, mask_ind)
         return X.group(rpn_loss + bbox_loss + mask_loss)
 
     @staticmethod
     def get_test_symbol(backbone, neck, rpn_head, roi_extractor, mask_roi_extractor, bbox_head, mask_head, bbox_post_processor):
-        im_info = X.var("im_info")
-        im_id = X.var("im_id")
-        rec_id = X.var("rec_id")
+        rec_id, im_id, im_info, proposal, proposal_score = \
+            MaskFasterRcnn.get_rpn_test_symbol(backbone, neck, rpn_head)
 
-        rpn_feat = backbone.get_rpn_feature()
         rcnn_feat = backbone.get_rcnn_feature()
-        rpn_feat = neck.get_rpn_feature(rpn_feat)
         rcnn_feat = neck.get_rcnn_feature(rcnn_feat)
 
-        proposal = rpn_head.get_all_proposal(rpn_feat, im_info)
         roi_feat = roi_extractor.get_roi_feature(rcnn_feat, proposal)
         cls_score, bbox_xyxy = bbox_head.get_prediction(roi_feat, im_info, proposal)
 
@@ -57,13 +53,18 @@ class MaskFasterRcnn(object):
         mask_roi_feat = mask_roi_extractor.get_roi_feature(rcnn_feat, post_bbox_xyxy)
         mask = mask_head.get_prediction(mask_roi_feat)
 
-        return X.group([rec_id, im_id, im_info, post_cls_score, post_bbox_xyxy, post_cls, mask])
+        # mask score only for placeholder
+        mask_score = mx.sym.full((1, ), -1, name='maskiou_prediction')
+        return X.group([rec_id, im_id, im_info, post_cls_score, post_bbox_xyxy, post_cls, mask, mask_score])
+
+    @staticmethod
+    def get_rpn_test_symbol(backbone, neck, rpn_head):
+        return FasterRcnn.get_rpn_test_symbol(backbone, neck, rpn_head)
 
 
 class BboxPostProcessor(object):
     def __init__(self, pTest):
-        super(BboxPostProcessor, self).__init__()
-        self.p = pTest
+        self.p = patch_config_as_nothrow(pTest)
 
     def get_post_processing(self, cls_score, bbox_xyxy):
         p = self.p
@@ -83,10 +84,10 @@ class BboxPostProcessor(object):
         return post_cls_score, post_bbox_xyxy, post_cls
 
 
-class MaskFPNRpnHead(FPNRpnHead):
+class MaskRpnHead(RpnHead):
     def __init__(self, pRpn, pMask):
-        super(MaskFPNRpnHead, self).__init__(pRpn)
-        self.pMask = pMask
+        super().__init__(pRpn)
+        self.pMask = patch_config_as_nothrow(pMask)
 
     def get_sampled_proposal(self, conv_fpn_feat, gt_bbox, gt_poly, im_info):
         p = self.p
@@ -109,7 +110,76 @@ class MaskFPNRpnHead(FPNRpnHead):
 
         mask_size = self.pMask.resolution
 
-        proposal = self.get_all_proposal(conv_fpn_feat, im_info)
+        (proposal, proposal_score) = self.get_all_proposal(conv_fpn_feat, im_info)
+
+        (bbox, label, bbox_target, bbox_weight, match_gt_iou, mask_target) = mx.sym.ProposalMaskTarget(
+            proposal,
+            gt_bbox,
+            gt_poly,
+            mask_size=mask_size,
+            num_classes=num_reg_class,
+            class_agnostic=class_agnostic,
+            batch_images=batch_image,
+            proposal_without_gt=proposal_wo_gt,
+            image_rois=image_roi,
+            fg_fraction=fg_fraction,
+            fg_thresh=fg_thr,
+            bg_thresh_hi=bg_thr_hi,
+            bg_thresh_lo=bg_thr_lo,
+            bbox_weight=bbox_target_weight,
+            bbox_mean=bbox_target_mean,
+            bbox_std=bbox_target_std,
+            output_iou=True,
+            name="subsample_proposal"
+        )
+
+        num_fg_rois_per_img = int(image_roi * fg_fraction)
+        mask_label = mx.sym.slice_axis(
+            label,
+            axis=1,
+            begin=0,
+            end=num_fg_rois_per_img
+        )
+        label = X.reshape(label, (-3, -2))
+        bbox_target = X.reshape(bbox_target, (-3, -2))
+        bbox_weight = X.reshape(bbox_weight, (-3, -2))
+        mask_target = X.reshape(mask_target, (-3, -2))
+        mask_proposal = mx.sym.slice_axis(
+            bbox,
+            axis=1,
+            begin=0,
+            end=num_fg_rois_per_img)
+
+        return bbox, label, bbox_target, bbox_weight, mask_proposal, mask_target, mask_label
+
+
+class MaskFPNRpnHead(FPNRpnHead):
+    def __init__(self, pRpn, pMask):
+        super().__init__(pRpn)
+        self.pMask = patch_config_as_nothrow(pMask)
+
+    def get_sampled_proposal(self, conv_fpn_feat, gt_bbox, gt_poly, im_info):
+        p = self.p
+
+        batch_image = p.batch_image
+
+        proposal_wo_gt = p.subsample_proposal.proposal_wo_gt
+        image_roi = p.subsample_proposal.image_roi
+        fg_fraction = p.subsample_proposal.fg_fraction
+        fg_thr = p.subsample_proposal.fg_thr
+        bg_thr_hi = p.subsample_proposal.bg_thr_hi
+        bg_thr_lo = p.subsample_proposal.bg_thr_lo
+        post_nms_top_n = p.proposal.post_nms_top_n
+
+        num_reg_class = p.bbox_target.num_reg_class
+        class_agnostic = p.bbox_target.class_agnostic
+        bbox_target_weight = p.bbox_target.weight
+        bbox_target_mean = p.bbox_target.mean
+        bbox_target_std = p.bbox_target.std
+
+        mask_size = self.pMask.resolution
+
+        (proposal, proposal_score) = self.get_all_proposal(conv_fpn_feat, im_info)
 
         (bbox, label, bbox_target, bbox_weight, match_gt_iou, mask_target) = mx.sym.ProposalMaskTarget(
             rois=proposal,
@@ -132,31 +202,46 @@ class MaskFPNRpnHead(FPNRpnHead):
             name="subsample_proposal"
         )
 
+        num_fg_rois_per_img = int(image_roi * fg_fraction)
+        mask_label = mx.sym.slice_axis(
+            label,
+            axis=1,
+            begin=0,
+            end=num_fg_rois_per_img
+        )
         label = X.reshape(label, (-3, -2))
         bbox_target = X.reshape(bbox_target, (-3, -2))
         bbox_weight = X.reshape(bbox_weight, (-3, -2))
         mask_target = X.reshape(mask_target, (-3, -2))
-
-        num_fg_rois_per_img = int(image_roi * fg_fraction)
         mask_proposal = mx.sym.slice_axis(
             bbox,
             axis=1,
             begin=0,
             end=num_fg_rois_per_img)
 
-        return bbox, label, bbox_target, bbox_weight, mask_proposal, mask_target
+        return bbox, label, bbox_target, bbox_weight, mask_proposal, mask_target, mask_label
 
 
 class MaskFasterRcnnHead(object):
     def __init__(self, pBbox, pMask, pMaskRoi):
-        self.pBbox = pBbox
-        self.pMask = pMask
-        self.pMaskRoi = pMaskRoi
+        self.pBbox = patch_config_as_nothrow(pBbox)
+        self.pMask = patch_config_as_nothrow(pMask)
+        self.pMaskRoi = patch_config_as_nothrow(pMaskRoi)
 
         self._head_feat = None
 
+    def add_norm(self, sym):
+        p = self.pMask
+        if p.normalizer.__name__ == "fix_bn":
+            pass
+        elif p.normalizer.__name__ in ["sync_bn", "local_bn", "gn", "dummy"]:
+            sym = p.normalizer(sym)
+        else:
+            raise NotImplementedError("Unsupported normalizer: {}".format(p.normalizer.__name__))
+        return sym
+
     def _get_mask_head_logit(self, conv_feat):
-        raise NotImplemented
+        raise NotImplementedError
 
     def get_output(self, conv_feat):
         pBbox = self.pBbox
@@ -190,7 +275,7 @@ class MaskFasterRcnnHead(object):
             name="mask_prob")
         return mask_prob
 
-    def get_loss(self, conv_feat, mask_target):
+    def get_loss(self, conv_feat, mask_target, mask_ind):
         pBbox = self.pBbox
         pMask = self.pMask
         batch_image = pBbox.batch_image
@@ -198,6 +283,16 @@ class MaskFasterRcnnHead(object):
         mask_fcn_logit = self.get_output(conv_feat)
 
         scale_loss_shift = 128.0 if pMask.fp16 else 1.0
+
+        mask_fcn_logits = mx.sym.split(mask_fcn_logit, num_outputs=batch_image, axis=0)
+        mask_inds = mx.sym.split(mask_ind, num_outputs=batch_image, axis=0, squeeze_axis=True)
+        mask_fcn_logit_list = []
+        for mask_fcn_logit, mask_ind in zip(mask_fcn_logits, mask_inds):
+            batch_ind = mx.sym.arange(pMask.num_fg_roi)
+            mask_ind = mx.sym.stack(batch_ind, mask_ind)
+            mask_fcn_logit = mx.sym.gather_nd(mask_fcn_logit, mask_ind, axis=1)
+            mask_fcn_logit_list.append(mask_fcn_logit)
+        mask_fcn_logit = mx.sym.concat(*mask_fcn_logit_list, dim=0)
 
         mask_fcn_logit = X.reshape(
             mask_fcn_logit,
@@ -220,7 +315,7 @@ class MaskFasterRcnnHead(object):
 
 class MaskFasterRcnn4ConvHead(MaskFasterRcnnHead):
     def __init__(self, pBbox, pMask, pMaskRoi):
-        super(MaskFasterRcnn4ConvHead, self).__init__(pBbox, pMask, pMaskRoi)
+        super().__init__(pBbox, pMask, pMaskRoi)
 
     def _get_mask_head_logit(self, conv_feat):
         if self._head_feat is not None:
@@ -233,14 +328,16 @@ class MaskFasterRcnn4ConvHead(MaskFasterRcnnHead):
 
         current = conv_feat
         for i in range(4):
-            current = X.convrelu(
+            current = X.conv(
                 current,
-                name="mask_fcn_conv{}".format(i),
+                name="mask_fcn_conv{}".format(i + 1),
                 filter=dim_reduced,
                 kernel=3,
                 no_bias=False,
                 init=msra_init
             )
+            current = self.add_norm(current)
+            current = X.relu(current)
 
         mask_up = current
         for i in range(up_stride // 2):
